@@ -1,19 +1,104 @@
+//! Interrupt Descriptor Table.
+//!
+//! The IDT tells the CPU where to find the handler for each of the
+//! 256 interrupt and exception vectors. It is loaded once at boot
+//! with `lidt` and remains in place for the life of the kernel.
+//!
+//! # Layout
+//!
+//! The table itself is a linker-placed region (see `linker.ld`,
+//! symbol `__idt_start`) of 256 entries, each 8 bytes. The region is
+//! `NOLOAD`, so it is not part of the disk image; the kernel writes
+//! the entries during `init`.
+//!
+//! # Vector assignments
+//!
+//! ```text
+//!   0 -  31   CPU exceptions
+//!  32 -  47   hardware IRQs (after PIC remap)
+//!  48 - 255   unused (reserved)
+//! ```
+//!
+//! CPU exceptions are handled by the stubs in `exceptions.S`.
+//! Hardware IRQs are handled by the stubs in `irq.S`. Both sets of
+//! stubs normalize the interrupt frame so that the Rust dispatcher
+//! sees a uniform layout.
+//!
+//! # Gate format
+//!
+//! Each entry is an 8-byte structure:
+//!
+//! ```text
+//!   +0   offset bits  0-15
+//!   +2   code segment selector
+//!   +4   reserved (zero)
+//!   +5   flags
+//!   +6   offset bits 16-31
+//! ```
+//!
+//! The flags byte is interpreted as:
+//!
+//! ```text
+//!   bit 7    P    present
+//!   bits 6-5 DPL  descriptor privilege level
+//!   bit 4    S    0 for system descriptors
+//!   bits 3-0 type 0xE = 32-bit interrupt gate, 0xF = 32-bit trap gate
+//! ```
+//!
+//! The kernel uses `0x8E`, which is a present, ring-0, 32-bit
+//! interrupt gate. Interrupt gates clear IF on entry, so the CPU
+//! will not deliver another interrupt while the handler runs. This
+//! is the usual choice for both exceptions and IRQs.
+
 use crate::arch;
 use core::arch::asm;
 
+/// Number of entries in the IDT.
+///
+/// The x86 architecture defines exactly 256 vectors, so this is
+/// fixed.
 const IDT_ENTRIES: usize = 256;
 
+/// First vector used for hardware IRQs after the PIC remap.
+const IRQ_VECTOR_BASE: usize = 32;
+
+/// Number of hardware IRQ vectors.
+///
+/// The 8259 PIC provides 16 IRQ lines (0-15), corresponding to
+/// vectors 32-47.
+const IRQ_VECTOR_COUNT: usize = 16;
+
+/// A single IDT entry.
+///
+/// The layout matches the format the CPU expects when it performs an
+/// interrupt vector lookup. The structure is `packed` because the
+/// fields are not naturally aligned: the offset is split across
+/// bytes 0-1 and 6-7 with unrelated fields in between.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct IdtEntry {
+    /// Low 16 bits of the handler's code-segment offset.
     offset_low: u16,
+
+    /// Code segment selector loaded into CS before the handler runs.
     selector: u16,
+
+    /// Reserved. Must be zero.
     zero: u8,
+
+    /// Gate flags. See the module documentation for the bit layout.
     flags: u8,
+
+    /// High 16 bits of the handler's code-segment offset.
     offset_high: u16,
 }
 
 impl IdtEntry {
+    /// An all-zero entry.
+    ///
+    /// An entry with the present bit clear causes the CPU to raise
+    /// #GP if the corresponding vector is ever delivered. This is
+    /// the correct initial state for a vector with no handler.
     const MISSING: Self = Self {
         offset_low: 0,
         selector: 0,
@@ -22,8 +107,13 @@ impl IdtEntry {
         offset_high: 0,
     };
 
+    /// Builds an entry for a ring-0, 32-bit interrupt gate.
+    ///
+    /// The handler address is split across the offset fields, and
+    /// the gate is marked present with DPL 0.
     fn new(handler: unsafe extern "C" fn()) -> Self {
         let address = handler as usize as u32;
+
         Self {
             offset_low: address as u16,
             selector: 0x08,
@@ -34,28 +124,68 @@ impl IdtEntry {
     }
 }
 
+/// The operand of the `lidt` instruction.
+///
+/// `lidt` reads 6 bytes from memory: a 2-byte limit followed by a
+/// 4-byte base. The structure is `packed` because the fields are
+/// not naturally aligned relative to each other.
 #[repr(C, packed)]
 struct IdtPointer {
+    /// Size of the IDT in bytes, minus one.
     limit: u16,
+
+    /// Linear address of the IDT.
     base: u32,
 }
 
+/// Returns a mutable pointer to the start of the IDT.
+///
+/// The IDT is a linker-placed region, not a Rust static, so it is
+/// accessed through `arch::__idt_start`.
 fn idt_base() -> *mut IdtEntry {
     arch::__idt_start() as *mut IdtEntry
 }
 
+/// Returns the linear address of the IDT.
+///
+/// This is the value loaded into the IDTR's base field by `lidt`.
 pub fn address() -> u32 {
     arch::__idt_start()
 }
 
+/// Writes one entry into the IDT.
+///
+/// The write is volatile: the IDT is read directly by the CPU on
+/// every interrupt, and the compiler must not elide or reorder the
+/// store.
+///
+/// # Safety
+///
+/// `vector` must be less than `IDT_ENTRIES`.
 unsafe fn set_entry(vector: usize, entry: IdtEntry) {
     unsafe {
         core::ptr::write_volatile(idt_base().add(vector), entry);
     }
 }
 
+/// Initializes the IDT and loads it with `lidt`.
+///
+/// Installs handlers for:
+///
+/// - CPU exceptions 0-31
+/// - hardware IRQs 32-47
+///
+/// Vectors 48-255 are left as `MISSING`. Delivering one of them
+/// raises #GP, which the kernel treats as a fatal exception.
+///
+/// Must be called exactly once, after the GDT is loaded and before
+/// any interrupt source is enabled.
 pub fn init() {
     unsafe {
+        // ---- CPU exceptions 0-31. ----
+        //
+        // The stubs in exceptions.S normalize the interrupt frame
+        // and call into Rust for dispatch.
         set_entry(0, IdtEntry::new(exception_entry_0));
         set_entry(1, IdtEntry::new(exception_entry_1));
         set_entry(2, IdtEntry::new(exception_entry_2));
@@ -89,6 +219,35 @@ pub fn init() {
         set_entry(30, IdtEntry::new(exception_entry_30));
         set_entry(31, IdtEntry::new(exception_entry_31));
 
+        // ---- Hardware IRQs 32-47. ----
+        //
+        // These vectors are only meaningful once the PIC has been
+        // remapped (see `cpu::pic::remap`). Before remapping, the
+        // PIC delivers IRQs at vectors 0x08-0x0F and 0x70-0x77,
+        // which would collide with CPU exceptions. The remap must
+        // therefore happen before any IRQ line is unmasked.
+        //
+        // The stubs in irq.S handle the end-of-interrupt protocol
+        // and return via `iret`.
+        set_entry(IRQ_VECTOR_BASE + 0, IdtEntry::new(irq_entry_32));
+        set_entry(IRQ_VECTOR_BASE + 1, IdtEntry::new(irq_entry_33));
+        set_entry(IRQ_VECTOR_BASE + 2, IdtEntry::new(irq_entry_34));
+        set_entry(IRQ_VECTOR_BASE + 3, IdtEntry::new(irq_entry_35));
+        set_entry(IRQ_VECTOR_BASE + 4, IdtEntry::new(irq_entry_36));
+        set_entry(IRQ_VECTOR_BASE + 5, IdtEntry::new(irq_entry_37));
+        set_entry(IRQ_VECTOR_BASE + 6, IdtEntry::new(irq_entry_38));
+        set_entry(IRQ_VECTOR_BASE + 7, IdtEntry::new(irq_entry_39));
+        set_entry(IRQ_VECTOR_BASE + 8, IdtEntry::new(irq_entry_40));
+        set_entry(IRQ_VECTOR_BASE + 9, IdtEntry::new(irq_entry_41));
+        set_entry(IRQ_VECTOR_BASE + 10, IdtEntry::new(irq_entry_42));
+        set_entry(IRQ_VECTOR_BASE + 11, IdtEntry::new(irq_entry_43));
+        set_entry(IRQ_VECTOR_BASE + 12, IdtEntry::new(irq_entry_44));
+        set_entry(IRQ_VECTOR_BASE + 13, IdtEntry::new(irq_entry_45));
+        set_entry(IRQ_VECTOR_BASE + 14, IdtEntry::new(irq_entry_46));
+        set_entry(IRQ_VECTOR_BASE + 15, IdtEntry::new(irq_entry_47));
+
+        // ---- Load the IDT. ----
+
         let pointer = IdtPointer {
             limit: (IDT_ENTRIES * 8 - 1) as u16,
             base: address(),
@@ -101,9 +260,40 @@ pub fn init() {
         );
     }
 
-    println!("Rust IDT loaded.");
+    println!(
+        "IDT loaded: {} entries, {} exceptions, {} IRQs",
+        IDT_ENTRIES, 32, IRQ_VECTOR_COUNT,
+    );
 }
 
+/// Returns the raw fields of one IDT entry, for diagnostics.
+///
+/// Returns `(offset_low, selector, zero, flags, offset_high)`.
+/// The handler address can be reconstructed as
+/// `(offset_high as u32) << 16 | offset_low as u32`.
+#[allow(dead_code)]
+pub fn debug_entry(vector: usize) -> (u16, u16, u8, u8, u16) {
+    assert!(vector < IDT_ENTRIES, "idt: vector out of range");
+
+    unsafe {
+        let entry = core::ptr::read_volatile(idt_base().add(vector));
+        (
+            entry.offset_low,
+            entry.selector,
+            entry.zero,
+            entry.flags,
+            entry.offset_high,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------
+// External handlers
+// ---------------------------------------------------------------------
+
+/// CPU exception stubs, defined in `exceptions.S`.
+///
+/// One symbol per vector, `exception_entry_N` for vector N.
 unsafe extern "C" {
     fn exception_entry_0();
     fn exception_entry_1();
@@ -139,15 +329,27 @@ unsafe extern "C" {
     fn exception_entry_31();
 }
 
-pub fn debug_entry(vector: usize) -> (u16, u16, u8, u8, u16) {
-    unsafe {
-        let entry = core::ptr::read_volatile(idt_base().add(vector));
-        (
-            entry.offset_low,
-            entry.selector,
-            entry.zero,
-            entry.flags,
-            entry.offset_high,
-        )
-    }
+/// Hardware IRQ stubs, defined in `irq.S`.
+///
+/// One symbol per IRQ, `irq_entry_N` for vector N. The number in
+/// the symbol name is the *vector* (32-47), not the IRQ line
+/// (0-15). The mapping from IRQ line to vector is
+/// `vector = 32 + irq`.
+unsafe extern "C" {
+    fn irq_entry_32();
+    fn irq_entry_33();
+    fn irq_entry_34();
+    fn irq_entry_35();
+    fn irq_entry_36();
+    fn irq_entry_37();
+    fn irq_entry_38();
+    fn irq_entry_39();
+    fn irq_entry_40();
+    fn irq_entry_41();
+    fn irq_entry_42();
+    fn irq_entry_43();
+    fn irq_entry_44();
+    fn irq_entry_45();
+    fn irq_entry_46();
+    fn irq_entry_47();
 }

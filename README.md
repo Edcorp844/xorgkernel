@@ -1126,7 +1126,7 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 * [x] Page tables
 * [x] Physical frame allocator
 * [x] IDT initialization
-* [ ] Interrupt handling
+* [x] Interrupt handling
 * [ ] Scheduler primitives
 * [ ] Context switching
 

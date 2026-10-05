@@ -58,7 +58,7 @@ impl fmt::Write for SerialPort {
     }
 }
 
-unsafe fn outb(port: u16, value: u8) {
+pub unsafe fn outb(port: u16, value: u8) {
     unsafe {
         core::arch::asm!(
             "out dx, al",
@@ -69,7 +69,7 @@ unsafe fn outb(port: u16, value: u8) {
     }
 }
 
-unsafe fn inb(port: u16) -> u8 {
+pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
 
     unsafe {
