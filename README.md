@@ -1132,15 +1132,15 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 
 ## Phase 1 — Capability Core
 
-* [ ] Object abstraction
-* [ ] Capability representation
-* [ ] Capability spaces
-* [ ] ITable
-* [ ] Generation counters
-* [ ] Capability lookup
-* [ ] Capability transfer
-* [ ] Capability restriction
-* [ ] Capability revocation
+* [x] Object abstraction
+* [x] Capability representation
+* [x] Capability spaces
+* [x] ITable
+* [x] Generation counters
+* [x] Capability lookup
+* [x] Capability transfer
+* [x] Capability restriction
+* [x] Capability revocation
 * [ ] Object lifetime management
 
 ## Phase 2 — Execution Fabric

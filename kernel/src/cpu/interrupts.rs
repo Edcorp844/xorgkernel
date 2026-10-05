@@ -37,7 +37,7 @@ const MAX_IRQS: usize = 16;
 /// quickly: it runs with interrupts disabled on the current CPU.
 /// Long work should be deferred to a bottom-half mechanism, which
 /// the kernel does not yet have.
-type IrqHandler = extern "C" fn();
+type IrqHandler = fn();
 
 /// Registered handlers, one slot per IRQ line.
 ///

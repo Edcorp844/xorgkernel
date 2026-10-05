@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[macro_use]
 mod macros;
 
@@ -18,6 +20,8 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::capability::capability::CapabilityRights;
+use crate::capability::core::MapError;
+use crate::capability::object::ObjectKind;
 
 // ---------------------------------------------------------------------
 // Timer tick state
@@ -82,6 +86,27 @@ pub extern "C" fn kernel_main() -> ! {
     memory::frame::init();
     capability::init();
 
+    // ---- Kernel heap. ----
+    //
+    // The heap needs a capability to the kernel's own address
+    // space, so it can install mappings into it as it grows. The
+    // fabric registers that address space once, at boot, and the
+    // heap holds the capability for its lifetime.
+    //
+    // The `MAP` right is required because the heap calls
+    // `map_memory` when it grows.
+    let kernel_as_rights =
+        CapabilityRights::MAP | CapabilityRights::UNMAP | CapabilityRights::SHARE;
+
+    let (_kernel_as_id, kernel_as_cap) = capability::core_mut()
+        .register_kernel_address_space(kernel_as_rights)
+        .expect("kernel address space registration failed");
+
+    memory::heap::init(kernel_as_cap);
+
+    println!();
+    println!("Kernel heap initialized.");
+
     // ---- Existing substrate tests. ----
     //
     // These run with interrupts disabled. They exercise the
@@ -90,6 +115,9 @@ pub extern "C" fn kernel_main() -> ! {
     // finish before interrupts are enabled.
     test_capability_transfer();
     test_cells();
+    test_memory_object_allocation();
+    test_map_memory();
+    test_heap(); // <-- add this line
     test_address_space();
     test_address_space_activation();
     test_kernel_mapping_sharing();
@@ -177,7 +205,7 @@ fn idle_loop() -> ! {
 /// a bottom half, which the kernel does not yet have.
 ///
 /// Prints a running count once every `TICKS_PER_REPORT` ticks.
-extern "C" fn on_timer_tick() {
+fn on_timer_tick() {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     if n % TICKS_PER_REPORT == 0 {
@@ -190,7 +218,17 @@ extern "C" fn on_timer_tick() {
 // ---------------------------------------------------------------------
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // Print the panic message and location if the console is
+    // initialized. During early boot the console may not be
+    // ready, in which case the writes go nowhere, but by the
+    // time tests run it's fully functional.
+    println!();
+    println!("========================================");
+    println!("           KERNEL PANIC");
+    println!("========================================");
+    println!("{}", info);
+
     loop {
         core::hint::spin_loop();
     }
@@ -265,11 +303,15 @@ fn test_capability_transfer() {
 
     let core = capability::core_mut();
 
-    let object = core.create_object().expect("object creation failed");
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
 
     println!("  Object created: {}", object.raw());
 
-    let parent_rights = CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT;
+    // `SHARE` replaces the old `GRANT` right: a capability with
+    // `SHARE` can be delegated to produce a derived capability.
+    let parent_rights = CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::SHARE;
 
     let parent = core
         .allocate(object, parent_rights)
@@ -308,6 +350,7 @@ fn test_capability_transfer() {
 
     println!("  Excess-rights rejection: SUCCESS");
 
+    // A capability without SHARE cannot be delegated.
     let restricted = core
         .allocate(object, CapabilityRights::READ)
         .expect("restricted capability allocation failed");
@@ -315,7 +358,7 @@ fn test_capability_transfer() {
     let denied = core.transfer(restricted, CapabilityRights::READ);
     assert!(denied.is_none());
 
-    println!("  GRANT enforcement: SUCCESS");
+    println!("  SHARE enforcement: SUCCESS");
 
     assert!(core.destroy_object(object));
 
@@ -339,7 +382,9 @@ fn test_cells() {
 
     println!("  CapabilityCore address: 0x{:08x}", core as *mut _ as u32);
 
-    let object = core.create_object().expect("object creation failed");
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
 
     println!("  Object created: {}", object.raw());
 
@@ -350,6 +395,92 @@ fn test_cells() {
     println!("  Creating Cell B...");
     let cell_b = core.create_cell().expect("cell B creation failed");
     println!("  Cell B: {}", cell_b.raw());
+}
+
+/// Tests the fabric's memory-object allocation path.
+///
+/// This exercises:
+///
+/// - `CapabilityCore::allocate_memory`, which allocates frames,
+///   creates a memory object, registers it, and returns a
+///   capability
+/// - `CapabilityCore::memory_object`, which resolves a capability
+///   back to the object
+/// - `CapabilityCore::lookup_object_kind`, which reports the
+///   object's kind
+/// - `CapabilityCore::transfer`, for deriving an attenuated
+///   capability
+/// - `CapabilityCore::destroy_object`, which revokes every
+///   capability and returns the object's frames
+fn test_memory_object_allocation() {
+    println!();
+    println!("Testing memory object allocation...");
+
+    let core = capability::core_mut();
+
+    // Allocate a 4-page memory object with MAP | READ | WRITE.
+    let rights = CapabilityRights::MAP
+        | CapabilityRights::READ
+        | CapabilityRights::WRITE
+        | CapabilityRights::SHARE;
+
+    let (object, cap) = core
+        .allocate_memory(4, rights)
+        .expect("memory object allocation failed");
+
+    println!("  Object created: {}", object.raw());
+    println!("  Capability:     0x{:08x}", cap.raw());
+
+    // The registry must report the object's kind.
+    assert_eq!(
+        core.lookup_object_kind(object),
+        Some(ObjectKind::MemoryObject)
+    );
+
+    println!("  Object kind: MemoryObject: SUCCESS");
+
+    // The capability must carry the rights that were requested.
+    assert!(core.has_rights(cap, CapabilityRights::MAP));
+    assert!(core.has_rights(cap, CapabilityRights::READ));
+    assert!(core.has_rights(cap, CapabilityRights::WRITE));
+    assert!(!core.has_rights(cap, CapabilityRights::EXECUTE));
+    assert!(core.has_rights(cap, CapabilityRights::SHARE));
+
+    println!("  Rights: MAP|READ|WRITE|SHARE: SUCCESS");
+
+    // The memory object must be resolvable through the capability.
+    let mem = core
+        .memory_object(cap)
+        .expect("memory object lookup failed");
+
+    assert_eq!(mem.page_count(), 4);
+
+    println!("  Frames: {}", mem.page_count());
+
+    for i in 0..4 {
+        let frame = mem.frame(i).expect("frame missing");
+        println!("    Frame {}: 0x{:08x}", i, frame.address());
+    }
+
+    // Derive an attenuated capability: READ only.
+    let read_only = core
+        .transfer(cap, CapabilityRights::READ)
+        .expect("transfer failed");
+
+    assert!(core.has_rights(read_only, CapabilityRights::READ));
+    assert!(!core.has_rights(read_only, CapabilityRights::WRITE));
+
+    println!("  Derived READ-only capability: 0x{:08x}", read_only.raw());
+    println!("  Attenuation: SUCCESS");
+
+    // Destroy the object. Both capabilities must become invalid,
+    // and the frames must be returned to the frame allocator.
+    assert!(core.destroy_object(object));
+
+    assert!(core.lookup(cap).is_none());
+    assert!(core.lookup(read_only).is_none());
+
+    println!("  Object-wide revocation: SUCCESS");
 }
 
 fn test_kernel_mapping_sharing() {
@@ -517,11 +648,214 @@ fn test_address_space_isolation() {
     println!("  Space A access: SUCCESS");
 
     // Note: the previous version of this test activated B and read
-    // the isolated VA, expecting a page fault. That fault is now
-    // caught by the exception handler, which halts the kernel. To
-    // keep the interrupt test reachable, the faulting portion of
-    // the isolation test has been removed. Once the exception
-    // handler is able to recover from faults (returning to a known
-    // recovery point), the fault-on-access demonstration can be
-    // re-enabled as a separate test that runs last.
+    // the isolated VA, expecting a page fault. That fault is caught
+    // by the exception handler, which halts the kernel. To keep the
+    // interrupt test reachable, the faulting portion has been
+    // removed. Once the exception handler is able to recover from
+    // faults (returning to a known recovery point), the
+    // fault-on-access demonstration can be re-enabled as a separate
+    // test that runs last.
+}
+
+/// Tests mapping a memory object into an address space through the
+/// fabric.
+///
+/// This exercises:
+///
+/// - `CapabilityCore::allocate_memory` and `allocate_address_space`
+/// - `CapabilityCore::map_memory`, which checks `MAP` on both
+///   capabilities and installs the memory object's frames into the
+///   address space
+/// - `CapabilityCore::address_space`, which resolves a capability
+///   back to its address space
+/// - `CapabilityCore::unmap_memory`, the mirror operation
+/// - Error handling: mapping with insufficient rights must fail
+fn test_map_memory() {
+    println!();
+    println!("Testing map_memory...");
+
+    let core = capability::core_mut();
+
+    // Allocate a memory object.
+    let mem_rights = CapabilityRights::MAP
+        | CapabilityRights::READ
+        | CapabilityRights::WRITE
+        | CapabilityRights::SHARE;
+
+    let (mo_id, mo_cap) = core
+        .allocate_memory(4, mem_rights)
+        .expect("memory object allocation failed");
+
+    println!("  Memory object: {}", mo_id.raw());
+    println!("  MO capability: 0x{:08x}", mo_cap.raw());
+
+    // Allocate an address space.
+    let as_rights = CapabilityRights::MAP
+        | CapabilityRights::UNMAP
+        | CapabilityRights::ACTIVATE
+        | CapabilityRights::SHARE;
+
+    let (as_id, as_cap) = core
+        .allocate_address_space(as_rights)
+        .expect("address space allocation failed");
+
+    println!("  Address space: {}", as_id.raw());
+    println!("  AS capability: 0x{:08x}", as_cap.raw());
+
+    // Map the object into the address space.
+    let va = 0x0080_0000;
+
+    println!(
+        "  Mapping VA 0x{:08x} <- memory object {}...",
+        va,
+        mo_id.raw()
+    );
+
+    core.map_memory(as_cap, mo_cap, va, true, false)
+        .expect("map_memory failed");
+
+    println!("  Mapping: SUCCESS");
+
+    // Verify the mapping through the address space.
+    let aspace = core
+        .address_space(as_cap)
+        .expect("address space lookup failed");
+
+    for i in 0..4 {
+        let page_va = va + i * 4096;
+        let translated = aspace.translate(page_va);
+
+        assert!(
+            translated.is_some(),
+            "page {} not mapped after map_memory",
+            i
+        );
+
+        println!(
+            "    VA 0x{:08x} -> PA 0x{:08x}",
+            page_va,
+            translated.unwrap()
+        );
+    }
+
+    println!("  Translation: SUCCESS");
+
+    // Mapping must fail if the caller lacks MAP on the address
+    // space. Derive a read-only capability and try again.
+    let ro_as = core
+        .transfer(as_cap, CapabilityRights::SHARE)
+        .expect("AS capability derivation failed");
+
+    // `ro_as` still carries SHARE but has dropped MAP, UNMAP,
+    // ACTIVATE. Mapping with it must fail.
+    let result = core.map_memory(ro_as, mo_cap, va + 0x10_0000, true, false);
+
+    assert_eq!(result, Err(MapError::MissingAddressSpaceMapRight));
+
+    println!("  Rights enforcement on AS: SUCCESS");
+
+    core.revoke(ro_as);
+
+    // Unmap the mapping.
+    println!("  Unmapping...");
+
+    for i in 0..4 {
+        let page_va = va + i * 4096;
+        let unmapped = core
+            .unmap_memory(as_cap, page_va)
+            .expect("unmap_memory failed");
+
+        println!(
+            "    VA 0x{:08x} unmapped (was PA 0x{:08x})",
+            page_va, unmapped
+        );
+    }
+
+    let aspace = core
+        .address_space(as_cap)
+        .expect("address space lookup failed");
+
+    assert!(!aspace.is_mapped(va));
+
+    println!("  Unmapping: SUCCESS");
+
+    // Destroy both objects. Their resources must be returned.
+    assert!(core.destroy_object(as_id));
+    assert!(core.destroy_object(mo_id));
+
+    assert!(core.lookup(as_cap).is_none());
+    assert!(core.lookup(mo_cap).is_none());
+
+    println!("  Object-wide revocation: SUCCESS");
+}
+
+/// Tests the kernel heap by allocating through Rust's `alloc`
+/// types.
+///
+/// This exercises:
+///
+/// - the global allocator, which delegates to the heap
+/// - the bump allocator within a slab
+/// - slab growth, when the first slab is exhausted
+/// - the `map_memory` path, which the heap calls when it grows
+fn test_heap() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    println!();
+    println!("Testing kernel heap...");
+
+    // A single boxed value.
+    let boxed = Box::new(42u32);
+
+    assert_eq!(*boxed, 42);
+
+    println!("  Box<u32> = {}: SUCCESS", *boxed);
+
+    // A vector that grows past one allocation.
+    let mut vec: Vec<u64> = Vec::new();
+
+    for i in 0..100 {
+        vec.push(i);
+    }
+
+    assert_eq!(vec.len(), 100);
+
+    for i in 0..100 {
+        assert_eq!(vec[i], i as u64);
+    }
+
+    println!("  Vec<u64> with 100 elements: SUCCESS");
+
+    // A vector large enough to force a slab growth.
+    //
+    // Each u64 is 8 bytes; 100 000 elements is 800 KiB, well past
+    // the 256 KiB slab size. This forces the heap to call
+    // `grow` and install a second slab through the fabric.
+    let mut big: Vec<u64> = Vec::new();
+
+    for i in 0..100_000 {
+        big.push(i as u64);
+    }
+
+    assert_eq!(big.len(), 100_000);
+    assert_eq!(big[50_000], 50_000);
+    assert_eq!(big[99_999], 99_999);
+
+    println!("  Vec<u64> with 100 000 elements: SUCCESS");
+
+    // Report committed bytes.
+    let committed = memory::heap::committed();
+
+    println!(
+        "  Committed: {} bytes ({} KiB)",
+        committed,
+        committed / 1024
+    );
+    println!("  Kernel heap: SUCCESS");
+
+    // Prevent the compiler from eliding the allocations.
+    core::hint::black_box(&boxed);
+    core::hint::black_box(&vec);
+    core::hint::black_box(&big);
 }

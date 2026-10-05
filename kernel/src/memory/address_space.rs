@@ -34,52 +34,45 @@
 //! kernel instructions. Without PDE 0, the very next instruction
 //! fetch after `activate` would fault.
 //!
-//! # Future direction
+//! # Relationship to the fabric
 //!
-//! As the kernel grows, this flat model will be replaced by a
-//! higher-half layout, where the kernel lives at a dedicated virtual
-//! range (for example `0xf000_0000` and above) and the low 4 GiB are
-//! available for user mappings. That change does not affect the
-//! structure of this module: it only changes which PDEs are copied
-//! and which are reserved for users.
+//! An address space is a fabric-managed object. It is created by
+//! [`crate::capability::core::CapabilityCore::allocate_address_space`],
+//! which allocates the page directory, registers the object, and
+//! returns a capability. Callers never hold a raw `AddressSpace`;
+//! they hold a `CapabilityId` and present it to the fabric.
+//!
+//! The `id` field stores the fabric's identifier for this object.
+//! It is set once, immediately after the fabric registers the
+//! address space, and never changes.
 
+use crate::capability::object::ObjectId;
 use crate::memory::direct_map;
 use crate::memory::frame;
 use crate::memory::paging;
 
-/// Size of a single x86 page, in bytes.
+/// Size of a single x86 page.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Page-directory entry flag: this entry maps a 4 MiB page.
-///
-/// When the PSE bit is set, the entry's address field points
-/// directly at a 4 MiB-aligned physical frame instead of at a page
-/// table.
+/// Page-directory entry: maps a 4 MiB page.
 const PAGE_SIZE_4MB: u32 = 1 << 7;
 
 /// First page-directory entry belonging to the kernel.
-///
-/// PDEs from this index upward are reserved for kernel mappings and
-/// are copied verbatim from the kernel page directory into every new
-/// address space.
 const KERNEL_PDE_START: usize = 768;
 
 /// Number of entries in an x86 page directory.
 const PAGE_DIRECTORY_ENTRIES: usize = 1024;
 
 /// Mask for the page-offset portion of a virtual address.
-///
-/// Also used to strip flags from PDEs and PTEs, since their address
-/// fields are aligned to 4 KiB.
 const PAGE_OFFSET_MASK: u32 = 0x0000_0fff;
 
-/// Page-table entry flag: page is present.
+/// Page-table entry: page is present.
 const PAGE_PRESENT: u32 = 1 << 0;
 
-/// Page-table entry flag: page is writable.
+/// Page-table entry: page is writable.
 const PAGE_WRITABLE: u32 = 1 << 1;
 
-/// Page-table entry flag: page is accessible from user mode.
+/// Page-table entry: page is accessible from user mode.
 const PAGE_USER: u32 = 1 << 2;
 
 /// A 32-bit x86 virtual address space.
@@ -92,11 +85,25 @@ const PAGE_USER: u32 = 1 << 2;
 /// CR3 to activate the address space. It is stable for the lifetime
 /// of the address space.
 pub struct AddressSpace {
+    /// The fabric's ID for this object.
+    ///
+    /// Assigned by the registry when the address space is created
+    /// through the fabric. `ObjectId::INVALID` before registration.
+    id: ObjectId,
+
     /// Physical address of this address space's page directory.
     ///
     /// Always page-aligned. Passed directly to CR3 by
     /// [`AddressSpace::activate`].
     page_directory: u32,
+
+    /// Whether this is the kernel's own address space.
+    ///
+    /// The kernel address space has authority over its entire
+    /// virtual range (except PDE 0, which is the identity map). A
+    /// user address space is restricted to PDEs 1-767 so that it
+    /// cannot overwrite the kernel mappings it inherits.
+    is_kernel: bool,
 }
 
 impl AddressSpace {
@@ -114,6 +121,11 @@ impl AddressSpace {
     ///
     /// Returns `None` if the frame allocator cannot provide a frame
     /// for the page directory.
+    ///
+    /// This is a low-level constructor. Callers that want a
+    /// fabric-managed address space should use
+    /// [`crate::capability::core::CapabilityCore::allocate_address_space`],
+    /// which registers the object and returns a capability.
     pub fn new() -> Option<Self> {
         let page_directory = frame::allocate()?.address();
 
@@ -121,7 +133,41 @@ impl AddressSpace {
 
         Self::copy_kernel_mappings(page_directory);
 
-        Some(Self { page_directory })
+        Some(Self {
+            id: ObjectId::INVALID,
+            page_directory,
+            is_kernel: false,
+        })
+    }
+
+    /// Wraps an existing page directory as an address space.
+    ///
+    /// Unlike `new`, this does not allocate a page directory and
+    /// does not copy kernel mappings. It is used to wrap the
+    /// kernel's own address space, which was established before
+    /// the fabric existed, so that the fabric can hand out a
+    /// capability to it.
+    ///
+    /// The `id` field is left as `INVALID`; the fabric sets it
+    /// during registration.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `page_directory` is a valid,
+    /// page-aligned page directory that is currently in use (or
+    /// intended to be used as) an address space. Passing a page
+    /// directory that is not properly initialized will cause
+    /// undefined behavior when the address space is activated.
+    pub(crate) fn from_page_directory(page_directory: u32) -> Self {
+        Self {
+            id: ObjectId::INVALID,
+            page_directory,
+            is_kernel: true,
+        }
+    }
+
+    pub fn is_kernel(&self) -> bool {
+        self.is_kernel
     }
 
     /// Activates this address space by loading its page directory
@@ -158,6 +204,23 @@ impl AddressSpace {
         self.page_directory
     }
 
+    /// Returns the fabric ID assigned to this object.
+    ///
+    /// Valid only after the fabric has registered the object.
+    /// Before registration this returns `ObjectId::INVALID`.
+    pub const fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    /// Sets the fabric ID.
+    ///
+    /// Called by the fabric during registration. Not public outside
+    /// the crate: the caller must go through
+    /// `CapabilityCore::allocate_address_space`.
+    pub(crate) fn set_id(&mut self, id: ObjectId) {
+        self.id = id;
+    }
+
     /// Copies the kernel portion of the kernel page directory into a
     /// newly created page directory.
     ///
@@ -178,15 +241,11 @@ impl AddressSpace {
         let source = direct_map::phys_to_virt(source_address) as *const u32;
         let destination = direct_map::phys_to_virt(page_directory) as *mut u32;
 
-        // Identity map: the kernel's code, data, and stack live in
-        // the low 4 MiB. Copying PDE 0 makes them reachable in the
-        // new address space without any further setup.
         let entry_0 = unsafe { core::ptr::read_volatile(source.add(0)) };
         unsafe {
             core::ptr::write_volatile(destination.add(0), entry_0);
         }
 
-        // Direct map and other kernel-only regions.
         for index in KERNEL_PDE_START..PAGE_DIRECTORY_ENTRIES {
             let entry = unsafe { core::ptr::read_volatile(source.add(index)) };
 
@@ -194,8 +253,6 @@ impl AddressSpace {
                 core::ptr::write_volatile(destination.add(index), entry);
             }
         }
-
-        // PDEs 1-767 remain zero: this is where user mappings live.
     }
 
     /// Maps one virtual page to one physical page.
@@ -204,19 +261,40 @@ impl AddressSpace {
     /// not yet point at a page table, a page table is allocated
     /// from the frame allocator and installed.
     ///
-    /// # Restrictions
+    /// # Allowed ranges
     ///
-    /// The mapping is refused if:
+    /// The set of virtual addresses this method will accept depends
+    /// on whether this address space is the kernel's own:
+    ///
+    /// - **Kernel address space** (`is_kernel == true`): any PDE
+    ///   except PDE 0. The kernel identity map at PDE 0 must not be
+    ///   overwritten, but the rest of the virtual space is available
+    ///   to the kernel. This is what allows the kernel heap to live
+    ///   at `0xd0000000` (PDE 832) and eventually what will allow
+    ///   the kernel to move to a higher-half layout.
+    ///
+    /// - **User address space** (`is_kernel == false`): PDEs 1-767
+    ///   only. PDE 0 holds the kernel identity map; PDEs 768-1023
+    ///   hold the kernel direct map. Both are copied from the
+    ///   kernel's page directory when the address space is created,
+    ///   and a user address space must not be able to overwrite
+    ///   them. All user mappings live in the middle range.
+    ///
+    /// Attempting to map outside the allowed range returns `false`
+    /// without modifying any page tables.
+    ///
+    /// # Return value
+    ///
+    /// Returns `true` on success, `false` if:
     ///
     /// - either address is not page-aligned
-    /// - `virtual_address` falls in PDE 0 (the kernel identity map)
-    /// - `virtual_address` falls at or above `KERNEL_PDE_START`
+    /// - `virtual_address` falls outside the allowed range for
+    ///   this address space
+    /// - a page table could not be allocated from the frame
+    ///   allocator
     ///
-    /// These restrictions keep user mappings from overwriting the
-    /// kernel's own PDEs.
-    ///
-    /// Returns `true` on success, `false` if the mapping was
-    /// refused or a page table could not be allocated.
+    /// On `false`, no partial state is left behind: either nothing
+    /// was modified, or the mapping was fully installed.
     pub fn map(
         &mut self,
         virtual_address: u32,
@@ -224,6 +302,8 @@ impl AddressSpace {
         writable: bool,
         user: bool,
     ) -> bool {
+        // ---- Validate alignment. ----
+
         if !is_page_aligned(virtual_address) || !is_page_aligned(physical_address) {
             return false;
         }
@@ -231,10 +311,28 @@ impl AddressSpace {
         let directory_index = page_directory_index(virtual_address);
         let table_index = page_table_index(virtual_address);
 
-        // Refuse PDE 0 (kernel identity map) and kernel PDEs.
-        if directory_index == 0 || directory_index >= KERNEL_PDE_START {
-            return false;
+        // ---- Validate the virtual address range. ----
+        //
+        // The permitted range depends on whether this is the
+        // kernel's address space or a user address space. See the
+        // method documentation for the rationale.
+
+        if self.is_kernel {
+            // Kernel address space: PDE 0 is off-limits (it holds
+            // the identity map), everything else is available.
+            if directory_index == 0 {
+                return false;
+            }
+        } else {
+            // User address space: PDE 0 and PDEs 768-1023 are
+            // off-limits, because they hold kernel mappings that
+            // were inherited from the kernel's page directory.
+            if directory_index == 0 || directory_index >= KERNEL_PDE_START {
+                return false;
+            }
         }
+
+        // ---- Ensure a page table exists for this PDE. ----
 
         let page_directory = direct_map::phys_to_virt(self.page_directory) as *mut u32;
 
@@ -251,6 +349,9 @@ impl AddressSpace {
 
             direct_map::clear_page(table_address);
 
+            // The PDE flags mirror the PTE flags that will be
+            // installed below: writable and, if this is a user
+            // mapping, user-accessible.
             let mut directory_flags = PAGE_PRESENT | PAGE_WRITABLE;
 
             if user {
@@ -263,16 +364,18 @@ impl AddressSpace {
                 core::ptr::write_volatile(page_directory.add(directory_index), directory_entry);
             }
         } else if user && directory_entry & PAGE_USER == 0 {
-            // Page table already exists but is kernel-only. Promote
-            // it so that user-mode accesses are permitted. This
-            // grants user access at the PDE level; individual PTEs
-            // still control which pages are user-accessible.
+            // Page table already exists, but it was created for
+            // kernel-only mappings. Promote it so that user-mode
+            // accesses are permitted. Individual PTEs still control
+            // which pages are user-accessible.
             directory_entry |= PAGE_USER;
 
             unsafe {
                 core::ptr::write_volatile(page_directory.add(directory_index), directory_entry);
             }
         }
+
+        // ---- Install the page-table entry. ----
 
         let table_address = directory_entry & !PAGE_OFFSET_MASK;
 
@@ -365,18 +468,12 @@ impl AddressSpace {
             return None;
         }
 
-        // 4 MiB large page: the PDE itself provides the physical
-        // base address. The low 22 bits of the virtual address are
-        // added directly.
         if directory_entry & PAGE_SIZE_4MB != 0 {
             let physical_base = directory_entry & 0xffc0_0000;
-
             let offset = virtual_address & 0x003f_ffff;
-
             return Some(physical_base | offset);
         }
 
-        // Ordinary 4 KiB page: walk the page table.
         let table_address = directory_entry & !PAGE_OFFSET_MASK;
 
         let page_table = direct_map::phys_to_virt(table_address) as *const u32;
@@ -388,7 +485,6 @@ impl AddressSpace {
         }
 
         let physical_page = entry & !PAGE_OFFSET_MASK;
-
         let offset = virtual_address & PAGE_OFFSET_MASK;
 
         Some(physical_page | offset)
@@ -402,16 +498,11 @@ impl AddressSpace {
 }
 
 /// Extracts the page-directory index from a virtual address.
-///
-/// Bits 22-31 of the virtual address select a PDE.
 const fn page_directory_index(address: u32) -> usize {
     ((address >> 22) & 0x3ff) as usize
 }
 
 /// Extracts the page-table index from a virtual address.
-///
-/// Bits 12-21 of the virtual address select a PTE within the page
-/// table chosen by `page_directory_index`.
 const fn page_table_index(address: u32) -> usize {
     ((address >> 12) & 0x3ff) as usize
 }

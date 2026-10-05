@@ -55,8 +55,8 @@ kernel: $(KERNEL_BIN)
 $(KERNEL_ELF):
 	cd $(KERNEL) && \
 	cargo +nightly build \
-		-Z build-std=core \
-		-Z json-target-spec
+    	-Z build-std=core,alloc \
+    	-Z json-target-spec
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) \
