@@ -1,0 +1,11 @@
+[build]
+target = "i686-none.json"
+
+[unstable]
+build-std = ["core"]
+
+[target.i686-none]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "relocation-model=static",
+]

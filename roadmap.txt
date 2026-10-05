@@ -1,0 +1,36 @@
+                 ┌─────────────────────────────┐
+                 │       Applications           │
+                 │ native / POSIX / Android     │
+                 └──────────────┬──────────────┘
+                                │
+                       capability handles
+                                │
+                 ┌──────────────▼──────────────┐
+                 │       Capability Fabric      │
+                 │                              │
+                 │ ITable / ownership / IPC     │
+                 │ revocation / accounting      │
+                 └──────────────┬──────────────┘
+                                │
+                     direct object references
+                                │
+                 ┌──────────────▼──────────────┐
+                 │        Resource Fabric       │
+                 │                              │
+                 │ memory │ CPU │ DMA │ devices │
+                 └──────────────┬──────────────┘
+                                │
+                         hardware substrate
+
+
+                                              OCAP FABRIC
+                          │
+          ┌───────────────┼────────────────┐
+          │               │                │
+       SAFETY          REALTIME         GENERAL
+        DOMAIN           DOMAIN          DOMAIN
+          │               │                │
+     static objects   pinned objects   dynamic objects
+     bounded IPC      bounded IPC      normal IPC
+     no allocation    controlled alloc  allocator
+     verified paths   deterministic     throughput
