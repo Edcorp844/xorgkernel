@@ -1127,7 +1127,7 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 * [x] Physical frame allocator
 * [x] IDT initialization
 * [x] Interrupt handling
-* [ ] Scheduler primitives
+* [x] Scheduler primitives
 * [ ] Context switching
 
 ## Phase 1 — Capability Core

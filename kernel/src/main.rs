@@ -10,12 +10,12 @@ mod arch;
 mod boot;
 mod capability;
 mod console;
+mod cpu;
 mod memory;
+mod sched;
 mod serial;
 mod sync;
 mod vga;
-
-mod cpu;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -119,6 +119,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
         .expect("kernel address space registration failed");
 
     memory::heap::init(kernel_as_cap);
+    sched::init();
 
     println!();
     println!("Kernel heap initialized.");
@@ -139,6 +140,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     test_kernel_mapping_sharing();
     test_frame_allocator();
     test_address_space_isolation();
+    test_scheduler();
 
     // ---- Interrupt subsystem. ----
     //
@@ -179,10 +181,7 @@ fn setup_framebuffer() {
     };
 
     let size_bytes = info.pitch * info.height;
-    let virt_base = crate::memory::direct_map::map_mmio(
-        info.address as u32,
-        size_bytes,
-    ) as *mut u8;
+    let virt_base = crate::memory::direct_map::map_mmio(info.address as u32, size_bytes) as *mut u8;
 
     if virt_base.is_null() {
         println!("Framebuffer: cannot map (address space exhausted)");
@@ -203,9 +202,12 @@ fn setup_framebuffer() {
             info.width as usize,
             info.height as usize,
             bytes_per_pixel,
-            info.red_shift, info.red_size,
-            info.green_shift, info.green_size,
-            info.blue_shift, info.blue_size,
+            info.red_shift,
+            info.red_size,
+            info.green_shift,
+            info.green_size,
+            info.blue_shift,
+            info.blue_size,
         )
     };
 
@@ -220,7 +222,6 @@ fn setup_framebuffer() {
         None => println!("Framebuffer present but not usable"),
     }
 }
-
 
 /// Configures the PIC, PIT, and IRQ dispatch path, then enables
 /// interrupts.
@@ -849,3 +850,89 @@ fn test_heap() {
     core::hint::black_box(&vec);
     core::hint::black_box(&big);
 }
+
+/// Tests the scheduler's data structures and policy without any
+/// context switching.
+///
+/// This verifies task creation, the intrusive list operations
+/// behind the run queues, priority-based selection, state
+/// transitions, and reaping.
+fn test_scheduler() {
+    use crate::sched::scheduler_mut;
+    use crate::sched::task::{PRIORITY_IDLE, PRIORITY_NORMAL, PRIORITY_REALTIME, TaskState};
+
+    println!();
+    println!("Testing scheduler primitives...");
+
+    let sched = scheduler_mut();
+
+    // Create three tasks at different priorities.
+    let idle = sched
+        .create("idle", task_idle, PRIORITY_IDLE, 4096)
+        .expect("idle task creation failed");
+    let kern = sched
+        .create("kern", task_kernel, PRIORITY_NORMAL, 4096)
+        .expect("kernel task creation failed");
+    let rt = sched
+        .create("rt", task_rt, PRIORITY_REALTIME, 4096)
+        .expect("realtime task creation failed");
+
+    println!("  Created: idle={} kern={} rt={}", idle, kern, rt);
+
+    // All three are ready.
+    assert_eq!(sched.task(idle).unwrap().state(), TaskState::Ready);
+    assert_eq!(sched.task(kern).unwrap().state(), TaskState::Ready);
+    assert_eq!(sched.task(rt).unwrap().state(), TaskState::Ready);
+
+    println!("  Initial states: all Ready");
+
+    // schedule() picks highest priority first.
+    assert_eq!(sched.schedule(), Some(rt));
+    assert_eq!(sched.task(rt).unwrap().state(), TaskState::Running);
+
+    assert_eq!(sched.schedule(), Some(kern));
+    assert_eq!(sched.task(kern).unwrap().state(), TaskState::Running);
+
+    assert_eq!(sched.schedule(), Some(idle));
+
+    // All queues now empty.
+    assert_eq!(sched.schedule(), None);
+
+    println!("  Priority order: SUCCESS");
+
+    // Re-enqueue the realtime task.
+    sched.make_ready(rt);
+    assert_eq!(sched.task(rt).unwrap().state(), TaskState::Ready);
+    assert_eq!(sched.schedule(), Some(rt));
+
+    println!("  Re-enqueue: SUCCESS");
+
+    // Block the kernel task.
+    sched.make_ready(kern);
+    sched.make_blocked(kern);
+    assert_eq!(sched.task(kern).unwrap().state(), TaskState::Blocked);
+    assert_eq!(sched.schedule(), None);
+
+    println!("  Blocked: SUCCESS");
+
+    // Wake it again.
+    sched.make_ready(kern);
+    assert_eq!(sched.task(kern).unwrap().state(), TaskState::Ready);
+    assert_eq!(sched.schedule(), Some(kern));
+
+    println!("  Wake: SUCCESS");
+
+    // Exit the kernel task.
+    sched.exit(kern);
+    assert!(sched.task(kern).is_none());
+
+    println!("  Exit and reap: SUCCESS");
+
+    println!("  Scheduler primitives: SUCCESS");
+}
+
+// Stub entry functions. These become real when context switching is
+// added.
+fn task_idle() {}
+fn task_kernel() {}
+fn task_rt() {}
