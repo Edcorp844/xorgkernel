@@ -1,57 +1,28 @@
+/*
+ * IRQ entry stubs.
+ *
+ * Hardware interrupts from the 8259 PIC arrive on vectors 32-47
+ * after the PIC has been remapped. The CPU pushes an interrupt
+ * frame (EIP, CS, EFLAGS) onto the current stack and jumps to the
+ * stub for the vector.
+ *
+ * Each stub:
+ *
+ *   1. Saves all general-purpose registers (pushal).
+ *   2. Pushes the IRQ line number as the argument to
+ *      irq_dispatch. The line number is `vector - 32`, because
+ *      vectors 32-47 correspond to IRQ lines 0-15.
+ *   3. Calls irq_dispatch.
+ *   4. Cleans up the argument.
+ *   5. Restores the general-purpose registers (popal).
+ *   6. Returns from the interrupt (iret).
+ */
+
 .code32
 
 .section .text
 
 .extern irq_dispatch
-
-/*
- * IRQ entry stubs.
- *
- * Hardware interrupts from the 8259 PIC arrive on vectors 32-47
- * (0x20-0x2F) after the PIC has been remapped. Unlike CPU
- * exceptions, hardware interrupts do not push an error code, and
- * they must be acknowledged and returned from with `iret` rather
- * than halting the CPU.
- *
- * The stub for each vector:
- *
- *   1. Pushes the IRQ number onto the stack.
- *   2. Calls the Rust dispatcher, which invokes the registered
- *      handler and sends an EOI to the PIC.
- *   3. Pops the IRQ number.
- *   4. Returns with `iret`, restoring the interrupted context.
- *
- * # Register saving
- *
- * The dispatcher is a normal C function. The C ABI says that
- * EAX, ECX, and EDX are caller-saved, so the callee is free to
- * clobber them. But an interrupt can happen at any time, including
- * in the middle of code that was relying on those registers. We
- * therefore save them in the stub.
- *
- * EBP, EBX, ESI, and EDI are callee-saved by the C ABI: the
- * dispatcher promises to preserve them, so the stub does not need
- * to save them explicitly. However, the compiler is free to use
- * EBP as a frame pointer, and we want the stack frame that `iret`
- * sees to be exactly what the CPU pushed, so we push a full
- * `pushal` anyway. The cost is negligible and the resulting code
- * is simpler to reason about.
- *
- * # Stack layout during dispatch
- *
- *   +0   EDI          ^
- *   +4   ESI          |
- *   +8   EBP          |  pushal
- *   +12  ESP_before   |
- *   +16  EBX          |
- *   +20  EDX          |
- *   +24  ECX          |
- *   +28  EAX          v
- *   +32  IRQ number
- *   +36  EIP          ^
- *   +40  CS           |  pushed by CPU on interrupt
- *   +44  EFLAGS       v
- */
 
 .macro IRQ_STUB vector
 
@@ -68,10 +39,7 @@ irq_entry_\vector:
 
 .endm
 
-
-/*
- * Vectors 32-47 correspond to IRQ0-15 after the PIC remap.
- */
+/* Vectors 32-47 correspond to IRQ lines 0-15. */
 
 IRQ_STUB 32
 IRQ_STUB 33

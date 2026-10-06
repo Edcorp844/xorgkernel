@@ -1,65 +1,62 @@
-pub const BOOT_INFO_ADDRESS: usize = 0x5000;
+//! Boot-time memory information.
+//!
+//! With GRUB, the memory map comes from the Multiboot2 information
+//! structure. This module wraps the parser in
+//! `crate::boot::multiboot2` and exposes it in the shape the frame
+//! allocator wants.
 
-const E820_MAX_ENTRIES: usize = 64;
+use crate::boot::multiboot2;
 
-const E820_TYPE_USABLE: u32 = 1;
-
-#[repr(C)]
+/// A single usable memory region.
 #[derive(Clone, Copy)]
 pub struct MemoryRegion {
     pub base: u64,
     pub length: u64,
-    pub region_type: u32,
-    pub attributes: u32,
 }
 
-#[repr(C)]
-pub struct BootInfo {
-    pub magic: u32,
-    pub memory_map_count: u32,
-    pub memory_map_address: u32,
-    pub kernel_start: u32,
-    pub kernel_end: u32,
+/// The kernel's physical load range, from the loader.
+///
+/// With GRUB, the kernel and its modules are described by a
+/// separate Multiboot2 tag. For now, we use the linker symbols
+/// (`__kernel_start`, `__kernel_end`) which are compiled into the
+/// image and reflect the actual physical range.
+pub fn kernel_range() -> (u32, u32) {
+    let start = crate::arch::__kernel_start();
+    let end = crate::arch::__kernel_end();
+    (start, end)
 }
 
-pub const BOOT_INFO_MAGIC: u32 = 0x4B42_494F; // "KBIO"
-
-pub struct MemoryMap {
-    entries: &'static [MemoryRegion],
-}
+/// Iterator over usable memory regions.
+pub struct MemoryMap;
 
 impl MemoryMap {
-    pub fn entries(&self) -> &'static [MemoryRegion] {
-        self.entries
-    }
-
-    pub fn usable_regions(&self) -> impl Iterator<Item = &'static MemoryRegion> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.region_type == E820_TYPE_USABLE)
+    /// Returns an iterator over every region the bootloader
+    /// reported as usable.
+    pub fn usable_regions(&self) -> impl Iterator<Item = MemoryRegion> {
+        multiboot2::memory_map()
+            .into_iter()
+            .flatten()
+            .inspect(|r| {
+                println!(
+                    "  raw region: base=0x{:x} length=0x{:x} kind={:?}",
+                    r.base, r.length, r.kind
+                );
+            })
+            .filter(|r| r.kind == multiboot2::RegionKind::Usable)
+            .map(|r| MemoryRegion {
+                base: r.base,
+                length: r.length,
+            })
     }
 }
 
-pub fn boot_info() -> &'static BootInfo {
-    unsafe { &*(BOOT_INFO_ADDRESS as *const BootInfo) }
-}
-
+/// Returns the memory map.
+///
+/// Panics if the Multiboot2 structure is missing a memory-map tag,
+/// which would indicate GRUB was misconfigured.
 pub fn memory_map() -> MemoryMap {
-    let info = boot_info();
-
-    if info.magic != BOOT_INFO_MAGIC {
-        panic!("invalid boot information");
+    if multiboot2::memory_map().is_none() {
+        panic!("Multiboot2 structure has no memory map tag");
     }
-
-    let count = info.memory_map_count as usize;
-
-    if count > E820_MAX_ENTRIES {
-        panic!("invalid memory map count");
-    }
-
-    let address = info.memory_map_address as usize;
-
-    let entries = unsafe { core::slice::from_raw_parts(address as *const MemoryRegion, count) };
-
-    MemoryMap { entries }
+    MemoryMap
 }

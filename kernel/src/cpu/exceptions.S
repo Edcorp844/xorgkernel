@@ -153,7 +153,7 @@ exception_entry_\vector:
      * If we see 'E' but nothing else, the fault happened after this
      * point but before the next marker.
      */
-    movb $'E', %al
+    movb $'X', %al
     outb %al, $0xE9
 
     /*

@@ -305,7 +305,7 @@ impl FrameAllocator {
         let map = boot::memory_map();
 
         for region in map.usable_regions() {
-            self.mark_region_usable(region);
+            self.mark_region_usable(&region);
         }
     }
 
@@ -363,7 +363,8 @@ impl FrameAllocator {
         // Kernel image loaded by the bootloader. Covers .text,
         // .rodata, and .data; the linker also reports this range
         // via BootInfo.
-        self.reserve_range(boot::boot_info().kernel_start, boot::boot_info().kernel_end);
+        let (kernel_start, kernel_end) = boot::kernel_range();
+        self.reserve_range(kernel_start, kernel_end);
 
         // Everything the linker placed between __bootstrap_start
         // and __kernel_end:

@@ -8,9 +8,9 @@
 //!
 //! The heap is a **bump allocator over a dedicated virtual range**.
 //! When the heap runs out of space, it asks the capability fabric
-//! for one or more memory objects and installs them into the next
-//! available page-aligned addresses in the heap's range. The heap
-//! then continues from where it left off.
+//! for a memory object and installs it into the next available
+//! page-aligned address in the heap's range. The heap then
+//! continues from where it left off.
 //!
 //! ```text
 //! HEAP_START                                              HEAP_END
@@ -24,11 +24,33 @@
 //!          current bump pointer
 //! ```
 //!
-//! A **region** is one or more contiguous memory objects installed
-//! consecutively in virtual address space. If a single request
-//! needs more space than one memory object can hold (256 KiB with
-//! the current `MAX_FRAMES = 64`), the heap installs multiple
-//! objects back-to-back and treats them as one region.
+//! # Region size
+//!
+//! Regions are a fixed size, [`REGION_FRAMES`] frames. The size is
+//! a policy choice, not a consequence of the pending allocation:
+//!
+//! - Small enough that installing a region on a memory-constrained
+//!   system does not waste much.
+//! - Large enough that a region serves many small allocations
+//!   before the heap needs to grow again.
+//!
+//! This decoupling matters. If the region size tracked the
+//! requested allocation size, a single large allocation would
+//! trigger a fabric round-trip to install exactly that much memory,
+//! and the resulting region would serve few subsequent allocations.
+//! A fixed region size amortizes the fabric cost across many
+//! allocations, regardless of the sizes involved.
+//!
+//! # Allocation size limit
+//!
+//! Because regions are a fixed size, the heap cannot serve an
+//! allocation larger than one region. [`MAX_ALLOCATION_FRAMES`]
+//! records this limit; `alloc` refuses a request that exceeds it
+//! by returning null.
+//!
+//! The limit is 1 MiB per allocation with the current constants.
+//! This covers every allocation the kernel is expected to make for
+//! the foreseeable future.
 //!
 //! # Why a virtual range
 //!
@@ -51,9 +73,28 @@
 //! current usage — long-lived data structures that outlive the
 //! kernel — this is acceptable.
 //!
-//! A free-list allocator (with per-size-class lists for O(1) alloc
-//! and dealloc) will replace this once the kernel has enough
-//! dynamic churn to justify it.
+//! # Bootstrap cycle
+//!
+//! The heap is backed by memory objects, and memory objects are
+//! backed by the heap only if their frame count exceeds
+//! [`crate::memory::object::INLINE_FRAMES`].
+//!
+//! The heap avoids the cycle by construction:
+//!
+//! - `REGION_FRAMES` (the number of frames in a heap region) is
+//!   equal to `INLINE_FRAMES` (the number of frames a memory
+//!   object can store without a heap allocation).
+//! - Every memory object that backs a heap region therefore uses
+//!   inline storage. Constructing it does not touch the heap, and
+//!   `grow` never recurses into `alloc`.
+//!
+//! If `REGION_FRAMES` were ever raised above `INLINE_FRAMES`, the
+//! recursion would reappear: `grow` would create a heap-allocated
+//! `MemoryObject`, whose `Vec<Frame>` would call back into the
+//! heap, whose empty state would call `grow` again, and so on.
+//!
+//! Keeping the two constants equal is the invariant that makes
+//! the heap bootstrappable.
 //!
 //! # Reentrancy
 //!
@@ -62,14 +103,10 @@
 //! interrupts disabled and with a guarantee that no other CPU is
 //! touching the heap. This matches the current single-threaded
 //! kernel.
-//!
-//! When the scheduler and preemption arrive, the heap will need
-//! either a lock with priority inheritance or a per-CPU design.
 
 use core::alloc::{GlobalAlloc, Layout};
 
 use crate::capability::capability::{CapabilityId, CapabilityRights};
-use crate::memory::object::MAX_FRAMES;
 
 /// First virtual address of the heap range.
 ///
@@ -88,22 +125,25 @@ pub const HEAP_END: u32 = 0xe000_0000;
 /// Size of a single page, in bytes.
 const PAGE_SIZE: u32 = 4096;
 
-/// Minimum number of frames to install when growing.
+/// Number of frames in a heap region.
 ///
-/// Even for a small request, the heap installs at least this many
-/// frames. This amortizes the cost of the fabric calls that back a
-/// region: allocation, registration, and mapping. Without a
-/// minimum, a `Box<u32>` would trigger a fabric round-trip for a
-/// single frame.
+/// Every region the heap installs is this size, regardless of the
+/// allocation that triggered the growth.
 ///
-/// 16 frames = 64 KiB, which is enough to cover many small
-/// allocations without dominating memory on a system that might
-/// only have a few megabytes of RAM.
-const MIN_GROW_FRAMES: usize = 16;
+/// The value must equal [`crate::memory::object::INLINE_FRAMES`],
+/// so that the memory object backing a region uses inline storage
+/// and does not recurse into the heap. See the module
+/// documentation on the bootstrap cycle.
+pub const REGION_FRAMES: usize = 256;
+
+/// Maximum size of a single heap allocation, in frames.
+///
+/// The heap cannot serve an allocation larger than one region,
+/// because `alloc` bumps a pointer through a single region and
+/// does not span regions. This constant records that limit.
+pub const MAX_ALLOCATION_FRAMES: usize = REGION_FRAMES;
 
 /// Kernel heap.
-///
-/// See the module documentation for the design.
 pub struct KernelHeap {
     /// Capability to the kernel's address space.
     ///
@@ -127,18 +167,11 @@ pub struct KernelHeap {
     current_region_end: u32,
 
     /// Total bytes committed to the heap so far.
-    ///
-    /// Incremented by the size of each region as it is installed.
-    /// Exposed for diagnostics.
     committed: u32,
 }
 
 impl KernelHeap {
     /// Creates an uninitialized heap.
-    ///
-    /// `address_space` must be a capability to the kernel's own
-    /// address space, with `MAP` right. The heap will call
-    /// `map_memory` with it whenever it grows.
     pub const fn new(address_space: CapabilityId) -> Self {
         Self {
             address_space,
@@ -151,16 +184,17 @@ impl KernelHeap {
 
     /// Allocates a block of memory.
     ///
-    /// Returns a null pointer on failure. Callers that use
-    /// `GlobalAlloc` should handle null as allocation failure.
+    /// Returns a null pointer on failure.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    ///
-    /// - no other thread is concurrently allocating
-    /// - interrupts are disabled
+    /// The caller must ensure that no other thread is concurrently
+    /// allocating and that interrupts are disabled.
     pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        unsafe {
+            marker(b'h');
+        }
+
         let align = layout.align().max(core::mem::align_of::<usize>());
         let size = layout.size();
 
@@ -176,16 +210,25 @@ impl KernelHeap {
             }
         }
 
-        // Otherwise, install a new region large enough for this
-        // request, then retry.
+        // The request does not fit in the current region. Check
+        // whether it can fit in a fresh region.
         //
-        // The new region needs to hold the alignment padding plus
-        // the requested size. Worst-case padding is `align - 1`
-        // bytes.
-        let padding = (align - 1) as u32;
-        let needed = (size as u32).saturating_add(padding);
+        // A fresh region starts at a page-aligned (and therefore
+        // maximally aligned) address, so no alignment padding is
+        // needed for the first allocation from it.
+        let frames_needed = ((size as u32 + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
 
-        if !unsafe { self.grow(needed) } {
+        if frames_needed > MAX_ALLOCATION_FRAMES {
+            // The request is too large for the heap to serve, no
+            // matter how many regions are installed.
+            return core::ptr::null_mut();
+        }
+
+        unsafe {
+            marker(b'g');
+        }
+
+        if !unsafe { self.grow() } {
             return core::ptr::null_mut();
         }
 
@@ -196,112 +239,83 @@ impl KernelHeap {
     ///
     /// The current implementation is a no-op: the heap is a bump
     /// allocator, and reclaimed bytes are not returned to the free
-    /// pool. See the module documentation for the migration plan.
+    /// pool. See the module documentation.
     ///
     /// # Safety
     ///
     /// The pointer and layout must be one previously returned by
-    /// `alloc`. This is required by the `GlobalAlloc` contract, but
-    /// the current implementation does not actually use them.
+    /// `alloc`.
     pub unsafe fn dealloc(&mut self, _ptr: *mut u8, _layout: Layout) {
-        // Intentionally empty. See module documentation.
+        // Intentionally empty.
     }
 
     /// Installs a new region at the end of the heap's virtual
-    /// range, large enough for a request of `needed` bytes.
+    /// range.
     ///
-    /// A region is one or more memory objects installed
-    /// consecutively. Each object holds at most `MAX_FRAMES`
-    /// frames. If `needed` requires more than one object, the heap
-    /// installs them back-to-back.
-    ///
-    /// # Parameters
-    ///
-    /// - `needed`: total bytes the region must provide, including
-    ///   worst-case alignment padding for the pending allocation.
-    ///
-    /// # Returns
-    ///
-    /// `true` on success. `false` if:
-    ///
-    /// - the request would exceed the heap's virtual range
-    /// - the fabric cannot allocate the memory objects
-    /// - the fabric cannot install the mappings
+    /// The region is always [`REGION_FRAMES`] frames.
     ///
     /// # Safety
     ///
-    /// Must be called with the fabric's global state accessible
-    /// (see `crate::capability::core_mut`). The fabric must not be
-    /// in the middle of another operation.
-    unsafe fn grow(&mut self, needed: u32) -> bool {
-        // Compute how many frames the region must hold. Round up
-        // to whole frames, then ensure the result is at least
-        // `MIN_GROW_FRAMES` so that small requests do not trigger
-        // a fabric round-trip per allocation.
-        let frames_needed = ((needed + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+    /// Must be called with the fabric's global state accessible.
+    unsafe fn grow(&mut self) -> bool {
+        unsafe {
+            marker(b'G');
+        }
 
-        let total_frames = frames_needed.max(MIN_GROW_FRAMES);
+        let total_bytes = (REGION_FRAMES as u32) * PAGE_SIZE;
 
         // The region must fit in the heap's virtual range.
-        let total_bytes = (total_frames as u32) * PAGE_SIZE;
-
         if self.next_region_va + total_bytes > HEAP_END {
+            unsafe {
+                marker(b'!');
+            }
             return false;
         }
 
-        // Install the region, one memory object at a time. Each
-        // object holds at most `MAX_FRAMES` frames.
         let region_start = self.next_region_va;
-        let mut cursor = region_start;
-        let mut remaining = total_frames;
 
-        while remaining > 0 {
-            let chunk = remaining.min(MAX_FRAMES);
-            let chunk_bytes = (chunk as u32) * PAGE_SIZE;
+        // Ask the fabric for a memory object large enough for the
+        // region.
+        let rights = CapabilityRights::MAP | CapabilityRights::READ | CapabilityRights::WRITE;
 
-            // Ask the fabric for a memory object.
-            //
-            // The object carries MAP|READ|WRITE. SHARE is not
-            // needed: the heap holds the object directly and never
-            // delegates it.
-            let rights = CapabilityRights::MAP | CapabilityRights::READ | CapabilityRights::WRITE;
+        let core = crate::capability::core_mut();
 
-            let core = crate::capability::core_mut();
-
-            let (object_id, object_cap) = match core.allocate_memory(chunk, rights) {
-                Some(result) => result,
-                None => return false,
-            };
-
-            // Install the object into the kernel's address space.
-            if core
-                .map_memory(self.address_space, object_cap, cursor, true, false)
-                .is_err()
-            {
-                // Roll back: destroy the object we just created.
-                //
-                // The mappings already installed are left in place.
-                // They are backed by memory objects whose
-                // capabilities we no longer hold, but the mappings
-                // themselves remain valid until the address space
-                // is destroyed. The heap does not track them, so
-                // they leak. This is a known limitation of the
-                // current design; see the module docs on
-                // deallocation. Once we have a proper region list,
-                // this rollback can be made complete.
-                core.destroy_object(object_id);
+        let (object_id, object_cap) = match core.allocate_memory(REGION_FRAMES, rights) {
+            Some(result) => {
+                unsafe {
+                    marker(b'1');
+                }
+                result
+            }
+            None => {
+                unsafe {
+                    marker(b'!');
+                }
                 return false;
             }
+        };
 
-            cursor += chunk_bytes;
-            remaining -= chunk;
+        // Install the object into the kernel's address space.
+        if core
+            .map_memory(self.address_space, object_cap, region_start, true, false)
+            .is_err()
+        {
+            unsafe {
+                marker(b'X');
+            }
+            core.destroy_object(object_id);
+            return false;
+        }
+
+        unsafe {
+            marker(b'2');
         }
 
         // Success. Update the heap's state.
         self.current = region_start;
-        self.current_region_end = cursor;
-        self.next_region_va = cursor;
-        self.committed += cursor - region_start;
+        self.current_region_end = region_start + total_bytes;
+        self.next_region_va = region_start + total_bytes;
+        self.committed += total_bytes;
 
         true
     }
@@ -320,28 +334,22 @@ const fn align_up(value: u32, align: u32) -> u32 {
 
 /// The kernel's global heap.
 ///
-/// Initialized by `init`, after the fabric is ready. Before
-/// initialization, `alloc` returns null and `dealloc` is a no-op.
-///
-/// # Safety
-///
-/// This is a `static mut` for the same reason the frame allocator
-/// and the capability core are: the `GlobalAlloc` trait is a
-/// global, not a capability-parameterized interface, so the heap's
-/// state has to live in a global. The capability that governs the
-/// heap is held inside the `KernelHeap`, not passed on each call.
+/// Initialized by [`init`], after the fabric is ready.
 static mut HEAP: Option<KernelHeap> = None;
 
 /// Initializes the global heap.
-///
-/// `address_space` must be a capability to the kernel's own
-/// address space, carrying `MAP`.
-///
-/// Must be called exactly once, after the fabric has registered
-/// the kernel address space.
 pub fn init(address_space: CapabilityId) {
     unsafe {
+        marker(b'I');
         HEAP = Some(KernelHeap::new(address_space));
+        marker(b'J');
+
+        // Read back and confirm.
+        let heap = &*core::ptr::addr_of!(HEAP);
+        match heap {
+            Some(_) => marker(b'1'),
+            None => marker(b'0'),
+        }
     }
 }
 
@@ -358,20 +366,50 @@ pub fn committed() -> u32 {
 }
 
 /// The kernel's global allocator.
-///
-/// Delegates every allocation to the global `HEAP`. This is what
-/// makes `Box`, `Vec`, `String`, and the rest of Rust's `alloc`
-/// types work in the kernel.
 struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         unsafe {
-            let heap = &mut *core::ptr::addr_of_mut!(HEAP);
+            marker(b'A');
+        }
 
+        let ptr = core::ptr::addr_of!(HEAP) as *const u8;
+        for i in 0..16 {
+            let b = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+            let hi = b >> 4;
+            let lo = b & 0x0F;
+            let hi_ch = if hi < 10 { b'0' + hi } else { b'A' + (hi - 10) };
+            let lo_ch = if lo < 10 { b'0' + lo } else { b'A' + (lo - 10) };
+            unsafe {
+                marker(hi_ch);
+            }
+            unsafe {
+                marker(lo_ch);
+            }
+            unsafe {
+                marker(b' ');
+            }
+        }
+        unsafe {
+            marker(b'|');
+        }
+
+        unsafe {
+            let heap = &mut *core::ptr::addr_of_mut!(HEAP);
             match heap {
-                Some(heap) => heap.alloc(layout),
-                None => core::ptr::null_mut(),
+                Some(h) => {
+                    unsafe {
+                        marker(b'K');
+                    }
+                    h.alloc(layout)
+                }
+                None => {
+                    unsafe {
+                        marker(b'N');
+                    }
+                    core::ptr::null_mut()
+                }
             }
         }
     }
@@ -389,3 +427,14 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+/// Writes a byte to the QEMU debug port.
+unsafe fn marker(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "out 0xE9, al",
+            in("al") byte,
+            options(nostack, preserves_flags),
+        );
+    }
+}

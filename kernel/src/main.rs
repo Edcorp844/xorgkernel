@@ -7,6 +7,7 @@ extern crate alloc;
 mod macros;
 
 mod arch;
+mod boot;
 mod capability;
 mod console;
 mod memory;
@@ -62,23 +63,33 @@ const TICKS_PER_REPORT: u32 = 100;
 /// The bootstrap stack is *not* zeroed here: it is placed above
 /// `__kernel_end` in the linker script and this function runs on it.
 unsafe fn clear_bootstrap_regions() {
+    unsafe {
+        marker(b'Z');
+    }
     let start = arch::__bootstrap_start() as *mut u8;
     let end = arch::__kernel_end() as *mut u8;
-
     let size = (end as usize) - (start as usize);
-
     unsafe {
         core::ptr::write_bytes(start, 0, size);
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     unsafe {
         clear_bootstrap_regions();
+        boot::multiboot2::init(multiboot_info);
     }
 
     console::init();
+    println!("multiboot_info = {:p}", multiboot_info);
+    println!("magic = 0x{:08x}", unsafe {
+        *(multiboot_info as *const u32)
+    });
+    println!("total_size = {}", unsafe {
+        *((multiboot_info as *const u32).add(1))
+    });
+
     cpu::gdt::init();
     cpu::idt::init();
     memory::paging::init();
@@ -623,7 +634,7 @@ fn test_address_space_isolation() {
     println!("Testing address-space isolation...");
 
     let mut space_a = AddressSpace::new().expect("space A creation failed");
-    let mut space_b = AddressSpace::new().expect("space B creation failed");
+    let space_b = AddressSpace::new().expect("space B creation failed");
 
     let isolated_va = 0x0080_0000;
     let backing_pa = 0x0010_0000;
@@ -646,30 +657,8 @@ fn test_address_space_isolation() {
     let value = unsafe { core::ptr::read_volatile(isolated_va as *const u32) };
     println!("  Read returned 0x{:08x}", value);
     println!("  Space A access: SUCCESS");
-
-    // Note: the previous version of this test activated B and read
-    // the isolated VA, expecting a page fault. That fault is caught
-    // by the exception handler, which halts the kernel. To keep the
-    // interrupt test reachable, the faulting portion has been
-    // removed. Once the exception handler is able to recover from
-    // faults (returning to a known recovery point), the
-    // fault-on-access demonstration can be re-enabled as a separate
-    // test that runs last.
 }
 
-/// Tests mapping a memory object into an address space through the
-/// fabric.
-///
-/// This exercises:
-///
-/// - `CapabilityCore::allocate_memory` and `allocate_address_space`
-/// - `CapabilityCore::map_memory`, which checks `MAP` on both
-///   capabilities and installs the memory object's frames into the
-///   address space
-/// - `CapabilityCore::address_space`, which resolves a capability
-///   back to its address space
-/// - `CapabilityCore::unmap_memory`, the mirror operation
-/// - Error handling: mapping with insufficient rights must fail
 fn test_map_memory() {
     println!();
     println!("Testing map_memory...");
@@ -858,4 +847,14 @@ fn test_heap() {
     core::hint::black_box(&boxed);
     core::hint::black_box(&vec);
     core::hint::black_box(&big);
+}
+
+unsafe fn marker(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "out 0xE9, al",
+            in("al") byte,
+            options(nostack, preserves_flags),
+        );
+    }
 }

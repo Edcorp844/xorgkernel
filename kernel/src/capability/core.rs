@@ -26,7 +26,7 @@ use crate::capability::itable::ITable;
 use crate::capability::object::{ObjectId, ObjectKind};
 use crate::capability::registry::ObjectRegistry;
 use crate::memory::address_space::AddressSpace;
-use crate::memory::object::{MAX_FRAMES, MemoryObject};
+use crate::memory::object::MemoryObject;
 use crate::memory::paging;
 
 /// Maximum number of execution cells managed by one capability domain.
@@ -37,6 +37,29 @@ const MAX_MEMORY_OBJECTS: usize = 256;
 
 /// Maximum number of address spaces managed by one capability domain.
 const MAX_ADDRESS_SPACES: usize = 64;
+
+/// Maximum number of frames `map_memory` can install in one call.
+///
+/// `map_memory` copies a memory object's frame addresses into a
+/// stack-allocated scratch buffer before iterating them. The
+/// buffer's size is fixed, so objects larger than this cannot be
+/// mapped.
+///
+/// 256 frames = 1 MiB. This matches `heap::REGION_FRAMES`: the
+/// heap installs regions of this size, and the regions must be
+/// mappable through `map_memory`. A smaller value would prevent
+/// the heap from installing its own regions; a larger value would
+/// waste stack space for a capability the heap does not exercise.
+///
+/// The scratch buffer is 256 * 4 = 1 KiB on the stack, which is
+/// negligible. `map_memory` is called only when the heap grows, a
+/// rare operation.
+///
+/// Lifting this bound requires the fabric to obtain the scratch
+/// buffer without going through the heap, which would deadlock
+/// during heap growth. See the module documentation on the
+/// bootstrap cycle.
+const MAX_MAPPABLE_FRAMES: usize = 256;
 
 /// Errors returned by the fabric's mapping operations.
 ///
@@ -71,6 +94,24 @@ pub enum MapError {
 
     /// The address space is out of page-table frames.
     OutOfMemory,
+
+    /// The memory object has more frames than `map_memory` can map
+    /// in one call.
+    ///
+    /// `map_memory` installs a memory object's frames into an
+    /// address space all at once, copying the frame addresses into
+    /// a fixed-size stack buffer first. The buffer is sized for
+    /// [`MAX_MAPPABLE_FRAMES`] frames; a larger object cannot be
+    /// mapped.
+    ///
+    /// This is a bootstrap limitation, not a design choice. Once
+    /// the fabric has a way to obtain scratch storage that does
+    /// not go through the heap, the bound will be lifted.
+    ///
+    /// A caller that encounters this error and genuinely needs to
+    /// map a larger object must split it into multiple objects,
+    /// each at or below the limit, and map each one separately.
+    ObjectTooLarge,
 }
 
 /// Central authority for objects, capabilities, memory, address
@@ -449,17 +490,20 @@ impl CapabilityCore {
     /// The permitted virtual range depends on the address space:
     ///
     /// - **Kernel address space** (`is_kernel == true`): any PDE
-    ///   except PDE 0. This is what allows the kernel heap to live
-    ///   at `0xd0000000` and future kernel data structures to live
-    ///   in the higher half.
-    ///
+    ///   except PDE 0.
     /// - **User address space** (`is_kernel == false`): PDEs 1-767
-    ///   only. PDE 0 holds the kernel identity map; PDEs 768-1023
-    ///   hold the kernel direct map. A user address space inherits
-    ///   these mappings and must not be able to overwrite them.
+    ///   only.
     ///
     /// An address outside the permitted range returns
     /// [`MapError::ForbiddenVirtualAddress`].
+    ///
+    /// # Size limit
+    ///
+    /// `map_memory` installs all of a memory object's frames in a
+    /// single call, copying the frame addresses into a
+    /// stack-allocated scratch buffer first. The buffer is sized
+    /// for [`MAX_MAPPABLE_FRAMES`] frames. A larger object is
+    /// rejected with [`MapError::ObjectTooLarge`].
     ///
     /// # Atomicity
     ///
@@ -481,11 +525,12 @@ impl CapabilityCore {
     ) -> Result<(), MapError> {
         // ---- Validate both capabilities. ----
         //
-        // We pull two things out of each capability: its object ID
-        // (used to find the object in the corresponding table) and
-        // whether it carries the rights we need. We also need the
-        // address space's `is_kernel` flag for the range check
-        // below, so we capture that here as well.
+        // We pull three things out of the address-space
+        // capability: its object ID, its `is_kernel` flag (for the
+        // range check below), and whether it carries `MAP`. We
+        // capture them all while the immutable borrow of `self` is
+        // live, so the borrow is released before we start mutating
+        // the address-space table.
 
         let (as_id, is_kernel) = {
             let cap = self
@@ -502,9 +547,6 @@ impl CapabilityCore {
 
             let as_id = cap.object();
 
-            // Fetch the `is_kernel` flag. We do this while the
-            // immutable borrow of `self` is still live, so we can
-            // avoid a second lookup later.
             let is_kernel = self
                 .address_space(address_space_cap)
                 .ok_or(MapError::InvalidAddressSpace)?
@@ -556,32 +598,53 @@ impl CapabilityCore {
             }
         }
 
+        // ---- Check that the object fits in the scratch buffer. ----
+        //
+        // `map_memory` copies the object's frame addresses into a
+        // fixed-size stack array before installing any mappings.
+        // The array cannot grow, so objects above the limit are
+        // rejected here, before any page tables are touched.
+
+        let frame_count = {
+            let mem = self
+                .memory_object(memory_object_cap)
+                .ok_or(MapError::InvalidMemoryObject)?;
+
+            mem.page_count()
+        };
+
+        if frame_count > MAX_MAPPABLE_FRAMES {
+            return Err(MapError::ObjectTooLarge);
+        }
+
         // ---- Copy the object's frames. ----
         //
         // We cannot hold an immutable borrow of the fabric (to read
         // the memory object) and a mutable borrow of an address
         // space (to install mappings) at the same time. So we copy
         // the frame addresses out first, then release the borrow.
+        //
+        // `frame_count` is already known to be at most
+        // `MAX_MAPPABLE_FRAMES`, so the array bounds are safe.
 
-        let mut frames: [Option<u32>; MAX_FRAMES] = [None; MAX_FRAMES];
-        let frame_count = {
+        let mut frames: [Option<u32>; MAX_MAPPABLE_FRAMES] = [None; MAX_MAPPABLE_FRAMES];
+
+        {
             let mem = self
                 .memory_object(memory_object_cap)
                 .ok_or(MapError::InvalidMemoryObject)?;
 
-            let count = mem.page_count();
-            for i in 0..count {
+            for i in 0..frame_count {
                 frames[i] = mem.frame(i).map(|f| f.address());
             }
-            count
-        };
+        }
 
         // ---- Install the mappings. ----
         //
-        // The `mo_id` variable is only used to confirm the memory
-        // object exists; the actual frames have already been copied
-        // out above. Prefix with underscore to silence the
-        // unused-variable warning.
+        // `mo_id` was captured during capability validation and is
+        // not needed here; the frames have already been copied out.
+        // Prefix with underscore to silence the unused-variable
+        // warning.
         let _ = mo_id;
 
         for slot in self.address_spaces.iter_mut() {
@@ -607,8 +670,7 @@ impl CapabilityCore {
 
         // The address-space capability resolved earlier, but by the
         // time we got here the object is gone. This should not
-        // happen while holding the fabric lock; return the most
-        // specific error available.
+        // happen while the fabric is exclusively borrowed.
         Err(MapError::InvalidAddressSpace)
     }
 
