@@ -1128,7 +1128,7 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 * [x] IDT initialization
 * [x] Interrupt handling
 * [x] Scheduler primitives
-* [ ] Context switching
+* [x] Context switching
 
 ## Phase 1 — Capability Core
 
@@ -1145,10 +1145,10 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 
 ## Phase 2 — Execution Fabric
 
-* [ ] Execution cells
+* [x] Execution cells
 * [ ] Thread objects
 * [ ] Address-space objects
-* [ ] Scheduling domains
+* [x] Scheduling domains
 * [ ] IPC channels
 * [ ] Shared-memory objects
 * [ ] Zero-copy IPC
