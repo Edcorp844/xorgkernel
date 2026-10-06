@@ -123,7 +123,10 @@ pub struct Task {
 
     // ---- Resources. ----
     /// Kernel stack, owned by the task.
-    pub kernel_stack: Box<[u8]>,
+    ///
+    /// `None` for the bootstrap context, which runs on the initial
+    /// stack. Every real task has `Some(...)`.
+    pub kernel_stack: Option<Box<[u8]>>,
 
     /// Base virtual address of the kernel stack.
     pub kernel_stack_base: u32,
@@ -159,7 +162,7 @@ impl Task {
     pub fn create(
         id: u32,
         name: &'static str,
-        entry: fn(),
+        entry: fn() -> !,
         priority: u8,
         stack_size: usize,
     ) -> Option<Self> {
@@ -176,11 +179,21 @@ impl Task {
         let top = base + stack_size as u32;
 
         // Lay out the initial frame at the top of the stack.
+        //
+        // Writing directly into the stack bytes is safe because the
+        // stack was just allocated and nothing else has touched it.
         let mut sp = top;
         unsafe {
+            // Return address: the entry point.
             sp -= 4;
             core::ptr::write(sp as *mut u32, entry as usize as u32);
 
+            // Saved callee-saved registers.
+            //
+            // The order here must match the pop order in
+            // `switch_context`: the routine pops EBX, ESI, EDI,
+            // EBP, so the stack from lowest to highest must be
+            // EBX, ESI, EDI, EBP.
             sp -= 4;
             core::ptr::write(sp as *mut u32, 0); // EBP
             sp -= 4;
@@ -201,10 +214,42 @@ impl Task {
             all_prev: None,
             run_next: None,
             run_prev: None,
-            kernel_stack,
+            kernel_stack: Some(kernel_stack),
             kernel_stack_base: base,
             kernel_stack_size: stack_size as u32,
         })
+    }
+
+    /// Creates a placeholder task for the kernel bootstrap context.
+    ///
+    /// The bootstrap context represents `kernel_main` running on the
+    /// initial stack, before any real task exists. It is passed as
+    /// the `from` argument to the first `switch_context` call, so
+    /// that the routine has somewhere to save the kernel's own
+    /// registers.
+    ///
+    /// After the first switch, the bootstrap context is never used
+    /// again: the kernel runs as the idle task or as one of the
+    /// tasks it created. It is never scheduled, never observed by
+    /// anything other than `switch_context`, and never reaped.
+    ///
+    /// The `esp` field is zero and is overwritten by
+    /// `switch_context` on the first call.
+    pub const fn bootstrap() -> Self {
+        Self {
+            esp: 0,
+            id: 0,
+            name: "kernel",
+            state: TaskState::Running,
+            priority: 0,
+            all_next: None,
+            all_prev: None,
+            run_next: None,
+            run_prev: None,
+            kernel_stack: None,
+            kernel_stack_base: 0,
+            kernel_stack_size: 0,
+        }
     }
 
     /// Returns whether the task is currently in the all-tasks list.

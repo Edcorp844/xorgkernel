@@ -17,6 +17,18 @@
 //! The scheduler picks the highest-priority non-empty run queue and
 //! pops the task at its front. The `active` bitmask tracks which
 //! priorities have tasks, so selection is O(1).
+//!
+//! # Context switching
+//!
+//! `schedule_and_switch` (in `mod.rs`) selects the next task to run
+//! and, if it differs from the current task, calls `switch_context`
+//! to move execution to it.
+//!
+//! The scheduler's `current` field tracks which task is running.
+//! Before any tasks are created, `current == 0`, meaning "the
+//! kernel is running directly, not as a task". The first
+//! `schedule_and_switch` transitions from this state into the first
+//! scheduled task.
 
 use alloc::boxed::Box;
 
@@ -46,7 +58,8 @@ pub struct Scheduler {
     /// Bitmask of non-empty run queues.
     active: u32,
 
-    /// ID of the currently running task, or 0 if none.
+    /// ID of the currently running task, or 0 if the kernel is
+    /// running directly without a task.
     current: u32,
 
     /// Next task ID to assign.
@@ -70,12 +83,20 @@ impl Scheduler {
     /// The task is placed in the `Ready` state and enqueued on its
     /// priority's run queue.
     ///
+    /// The `entry` parameter has type `fn() -> !` because a task
+    /// must never return. When the task is first scheduled,
+    /// `switch_context` returns directly into the entry function
+    /// with no return address on the stack; if the function were to
+    /// return, the CPU would jump to whatever garbage lies below it.
+    /// Declaring the entry point as returning `!` makes the compiler
+    /// enforce this at every call site.
+    ///
     /// Returns the task's ID, or `None` if the heap cannot provide
     /// the kernel stack.
     pub fn create(
         &mut self,
         name: &'static str,
-        entry: fn(),
+        entry: fn() -> !,
         priority: u8,
         stack_size: usize,
     ) -> Option<u32> {
@@ -104,12 +125,20 @@ impl Scheduler {
     }
 
     /// Returns a reference to a task by ID.
+    ///
+    /// Linear in the number of live tasks. Fine for the current
+    /// scale; a hash table can replace it later.
     pub fn task(&self, id: u32) -> Option<&Task> {
         unsafe { self.all_tasks.iter().find(|t| t.id == id) }
     }
 
-    /// Returns a mutable pointer to a task by ID, or null.
-    fn task_ptr(&self, id: u32) -> *mut Task {
+    /// Returns a raw pointer to a task by ID, or null if not found.
+    ///
+    /// The pointer is valid until the task is reaped by `exit`.
+    pub fn task_ptr(&self, id: u32) -> *mut Task {
+        if id == 0 {
+            return core::ptr::null_mut();
+        }
         unsafe {
             for task in self.all_tasks.iter() {
                 if task.id == id {
@@ -125,7 +154,18 @@ impl Scheduler {
         self.current
     }
 
+    /// Sets the current task ID.
+    ///
+    /// Called by `schedule_and_switch` after selecting a task, and
+    /// by the bootstrap code when transitioning from kernel-direct
+    /// execution to the first task.
+    pub fn set_current(&mut self, id: u32) {
+        self.current = id;
+    }
+
     /// Marks a task as `Ready` and enqueues it.
+    ///
+    /// If the task is already ready, this is a no-op.
     pub fn make_ready(&mut self, id: u32) {
         let task_ptr = self.task_ptr(id);
         if task_ptr.is_null() {
@@ -174,6 +214,9 @@ impl Scheduler {
     }
 
     /// Marks a task as `Dead` and removes it from the scheduler.
+    ///
+    /// The kernel stack and other resources are released when the
+    /// `Box<Task>` is dropped.
     pub fn exit(&mut self, id: u32) {
         let task_ptr = self.task_ptr(id);
         if task_ptr.is_null() {
@@ -201,6 +244,9 @@ impl Scheduler {
     }
 
     /// Selects the next task to run.
+    ///
+    /// Returns the ID of the highest-priority ready task, or `None`
+    /// if no task is ready.
     pub fn schedule(&mut self) -> Option<u32> {
         if self.active == 0 {
             return None;
