@@ -2,20 +2,24 @@
 //!
 //! An [`AddressSpace`] owns a page directory and the user mappings
 //! installed beneath it. Kernel mappings are inherited from the
-//! kernel's own page directory so that the kernel remains executable
-//! and reachable after switching to a new address space.
+//! kernel's own page directory so that the kernel remains
+//! executable and reachable after switching to a new address
+//! space.
 //!
-//! # Layout assumptions
+//! # Layout
 //!
-//! The current kernel uses a simple, flat layout. Every address
-//! space has the same PDE structure at the top level:
+//! The 32-bit virtual address space is divided into four regions:
 //!
 //! ```text
 //! PDE 0        identity map of the low 4 MiB
 //!              (kernel code, data, stack)
 //!
-//! PDEs 1-767   user mappings
-//!              (available for AddressSpace::map)
+//! PDEs 1-255   user mappings
+//!
+//! PDEs 256-259 kernel framebuffer mapping
+//!              (mapped by `direct_map::map_mmio`)
+//!
+//! PDEs 260-767 user mappings (continued)
 //!
 //! PDEs 768-    kernel direct map and kernel-only regions
 //! 1023         (copied verbatim from the kernel page directory)
@@ -23,16 +27,25 @@
 //!
 //! The split is enforced by:
 //!
-//! - [`AddressSpace::copy_kernel_mappings`], which copies PDE 0 and
-//!   PDEs 768-1023 from the kernel page directory.
-//! - [`AddressSpace::map`] and [`AddressSpace::unmap`], which refuse
-//!   to touch PDE 0 or any PDE at or above `KERNEL_PDE_START`.
+//! - [`AddressSpace::copy_kernel_mappings`], which copies PDE 0,
+//!   the framebuffer PDE range, and PDEs 768-1023 from the kernel
+//!   page directory.
+//! - [`AddressSpace::map`] and [`AddressSpace::unmap`], which
+//!   refuse to touch PDE 0, the framebuffer range, or any PDE at
+//!   or above `KERNEL_PDE_START`.
 //!
 //! The identity map at PDE 0 is essential. Kernel code and the
-//! kernel stack live in the low 4 MiB, and once CR3 points at a new
-//! page directory, the CPU must still be able to fetch and execute
-//! kernel instructions. Without PDE 0, the very next instruction
-//! fetch after `activate` would fault.
+//! kernel stack live in the low 4 MiB, and once CR3 points at a
+//! new page directory, the CPU must still be able to fetch and
+//! execute kernel instructions. Without PDE 0, the very next
+//! instruction fetch after `activate` would fault.
+//!
+//! The framebuffer mapping must also be present in every address
+//! space, because the console dispatcher writes to the framebuffer
+//! regardless of which address space is active. If the mapping
+//! were missing, any `println!` after switching CR3 would fault,
+//! and the fault handler would try to print to the same console,
+//! causing a recursive fault.
 //!
 //! # Relationship to the fabric
 //!
@@ -75,11 +88,25 @@ const PAGE_WRITABLE: u32 = 1 << 1;
 /// Page-table entry: page is accessible from user mode.
 const PAGE_USER: u32 = 1 << 2;
 
+/// First PDE used by the framebuffer mapping.
+///
+/// The framebuffer is mapped at virtual `0x40000000` by
+/// [`direct_map::map_mmio`]. `0x40000000 >> 22 == 256`.
+pub const FRAMEBUFFER_PDE_START: usize = 256;
+
+/// One past the last PDE used by the framebuffer mapping.
+///
+/// The framebuffer occupies at most a handful of 4 MiB pages. Four
+/// pages (16 MiB) is enough for a 1920x1080 framebuffer at 32 bpp
+/// (about 8 MiB) with headroom for future larger modes.
+pub const FRAMEBUFFER_PDE_END: usize = 260;
+
 /// A 32-bit x86 virtual address space.
 ///
-/// Each address space owns its own page directory. User mappings are
-/// installed below `KERNEL_PDE_START`; kernel mappings are inherited
-/// from the kernel page directory when the address space is created.
+/// Each address space owns its own page directory. User mappings
+/// are installed below `KERNEL_PDE_START` (except in the reserved
+/// framebuffer range); kernel mappings are inherited from the
+/// kernel page directory when the address space is created.
 ///
 /// The page directory's physical address is the value loaded into
 /// CR3 to activate the address space. It is stable for the lifetime
@@ -101,8 +128,8 @@ pub struct AddressSpace {
     ///
     /// The kernel address space has authority over its entire
     /// virtual range (except PDE 0, which is the identity map). A
-    /// user address space is restricted to PDEs 1-767 so that it
-    /// cannot overwrite the kernel mappings it inherits.
+    /// user address space is restricted so that it cannot overwrite
+    /// the kernel mappings it inherits.
     is_kernel: bool,
 }
 
@@ -113,6 +140,8 @@ impl AddressSpace {
     ///
     /// - a freshly allocated, zeroed page directory
     /// - the kernel identity map (PDE 0) copied from the kernel PD
+    /// - the framebuffer mapping (PDEs 256-259) copied from the
+    ///   kernel PD
     /// - the kernel direct map and kernel-only regions (PDEs
     ///   768-1023) copied from the kernel PD
     ///
@@ -144,9 +173,9 @@ impl AddressSpace {
     ///
     /// Unlike `new`, this does not allocate a page directory and
     /// does not copy kernel mappings. It is used to wrap the
-    /// kernel's own address space, which was established before
-    /// the fabric existed, so that the fabric can hand out a
-    /// capability to it.
+    /// kernel's own address space, which was established before the
+    /// fabric existed, so that the fabric can hand out a capability
+    /// to it.
     ///
     /// The `id` field is left as `INVALID`; the fabric sets it
     /// during registration.
@@ -166,6 +195,7 @@ impl AddressSpace {
         }
     }
 
+    /// Returns whether this is the kernel's own address space.
     pub fn is_kernel(&self) -> bool {
         self.is_kernel
     }
@@ -226,33 +256,53 @@ impl AddressSpace {
     ///
     /// The following PDEs are copied verbatim:
     ///
-    /// - PDE 0: the identity map covering the low 4 MiB. The kernel
-    ///   image and the kernel stack live here, and the CPU must be
-    ///   able to fetch kernel instructions and push/pop on the
-    ///   kernel stack immediately after a CR3 switch.
-    /// - PDEs 768-1023: the kernel direct map and other kernel-only
-    ///   regions.
+    /// - **PDE 0** — the identity map covering the low 4 MiB. The
+    ///   kernel image and the kernel stack live here, and the CPU
+    ///   must be able to fetch kernel instructions and push/pop on
+    ///   the kernel stack immediately after a CR3 switch.
     ///
-    /// PDEs 1-767 are left zero. These are the entries available
-    /// for user mappings, and [`AddressSpace::map`] will allocate
-    /// page tables for them on demand.
+    /// - **PDEs 256-259** — the framebuffer mapping. The console
+    ///   writes to the framebuffer regardless of which address space
+    ///   is active, so this mapping must be present in every address
+    ///   space.
+    ///
+    /// - **PDEs 768-1023** — the kernel direct map and other
+    ///   kernel-only regions.
+    ///
+    /// All other PDEs are left zero. PDEs 1-255 and 260-767 are
+    /// available for user mappings; `AddressSpace::map` will
+    /// allocate page tables for them on demand.
     fn copy_kernel_mappings(page_directory: u32) {
         let source_address = paging::page_directory_address();
         let source = direct_map::phys_to_virt(source_address) as *const u32;
         let destination = direct_map::phys_to_virt(page_directory) as *mut u32;
 
+        // Identity map (PDE 0).
         let entry_0 = unsafe { core::ptr::read_volatile(source.add(0)) };
         unsafe {
             core::ptr::write_volatile(destination.add(0), entry_0);
         }
 
-        for index in KERNEL_PDE_START..PAGE_DIRECTORY_ENTRIES {
+        // Framebuffer mapping (PDEs 256-259).
+        for index in FRAMEBUFFER_PDE_START..FRAMEBUFFER_PDE_END {
             let entry = unsafe { core::ptr::read_volatile(source.add(index)) };
-
             unsafe {
                 core::ptr::write_volatile(destination.add(index), entry);
             }
         }
+
+        // Direct map and kernel-only regions (PDEs 768-1023).
+        for index in KERNEL_PDE_START..PAGE_DIRECTORY_ENTRIES {
+            let entry = unsafe { core::ptr::read_volatile(source.add(index)) };
+            unsafe {
+                core::ptr::write_volatile(destination.add(index), entry);
+            }
+        }
+    }
+
+    /// Returns whether a PDE index is within the framebuffer range.
+    const fn is_framebuffer_pde(index: usize) -> bool {
+        index >= FRAMEBUFFER_PDE_START && index < FRAMEBUFFER_PDE_END
     }
 
     /// Maps one virtual page to one physical page.
@@ -267,18 +317,14 @@ impl AddressSpace {
     /// on whether this address space is the kernel's own:
     ///
     /// - **Kernel address space** (`is_kernel == true`): any PDE
-    ///   except PDE 0. The kernel identity map at PDE 0 must not be
-    ///   overwritten, but the rest of the virtual space is available
-    ///   to the kernel. This is what allows the kernel heap to live
-    ///   at `0xd0000000` (PDE 832) and eventually what will allow
-    ///   the kernel to move to a higher-half layout.
+    ///   except PDE 0 and the framebuffer range. The kernel identity
+    ///   map at PDE 0 and the framebuffer at PDEs 256-259 must not
+    ///   be overwritten, but the rest of the virtual space is
+    ///   available.
     ///
-    /// - **User address space** (`is_kernel == false`): PDEs 1-767
-    ///   only. PDE 0 holds the kernel identity map; PDEs 768-1023
-    ///   hold the kernel direct map. Both are copied from the
-    ///   kernel's page directory when the address space is created,
-    ///   and a user address space must not be able to overwrite
-    ///   them. All user mappings live in the middle range.
+    /// - **User address space** (`is_kernel == false`): PDEs 1-255
+    ///   and 260-767 only. PDE 0, the framebuffer range, and PDEs
+    ///   768-1023 hold kernel mappings and must not be overwritten.
     ///
     /// Attempting to map outside the allowed range returns `false`
     /// without modifying any page tables.
@@ -312,24 +358,21 @@ impl AddressSpace {
         let table_index = page_table_index(virtual_address);
 
         // ---- Validate the virtual address range. ----
-        //
-        // The permitted range depends on whether this is the
-        // kernel's address space or a user address space. See the
-        // method documentation for the rationale.
 
-        if self.is_kernel {
-            // Kernel address space: PDE 0 is off-limits (it holds
-            // the identity map), everything else is available.
-            if directory_index == 0 {
-                return false;
-            }
-        } else {
-            // User address space: PDE 0 and PDEs 768-1023 are
-            // off-limits, because they hold kernel mappings that
-            // were inherited from the kernel's page directory.
-            if directory_index == 0 || directory_index >= KERNEL_PDE_START {
-                return false;
-            }
+        if directory_index == 0 {
+            // The identity map. Never modifiable.
+            return false;
+        }
+
+        if Self::is_framebuffer_pde(directory_index) {
+            // The framebuffer mapping. Never modifiable.
+            return false;
+        }
+
+        if !self.is_kernel && directory_index >= KERNEL_PDE_START {
+            // Kernel direct map and kernel-only regions. Not
+            // modifiable from a user address space.
+            return false;
         }
 
         // ---- Ensure a page table exists for this PDE. ----
@@ -407,7 +450,8 @@ impl AddressSpace {
     /// Returns the physical address that was mapped, or `None` if:
     ///
     /// - `virtual_address` is not page-aligned
-    /// - the address falls in PDE 0 or at or above `KERNEL_PDE_START`
+    /// - the address falls in PDE 0, the framebuffer range, or at
+    ///   or above `KERNEL_PDE_START`
     /// - no mapping was present
     pub fn unmap(&mut self, virtual_address: u32) -> Option<u32> {
         if !is_page_aligned(virtual_address) {
@@ -417,7 +461,15 @@ impl AddressSpace {
         let directory_index = page_directory_index(virtual_address);
         let table_index = page_table_index(virtual_address);
 
-        if directory_index == 0 || directory_index >= KERNEL_PDE_START {
+        if directory_index == 0 {
+            return None;
+        }
+
+        if Self::is_framebuffer_pde(directory_index) {
+            return None;
+        }
+
+        if !self.is_kernel && directory_index >= KERNEL_PDE_START {
             return None;
         }
 
@@ -450,9 +502,9 @@ impl AddressSpace {
     /// Translates a virtual address to its physical address.
     ///
     /// Supports both 4 KiB pages and 4 MiB large pages. The latter
-    /// are used by the kernel direct map, so translating a kernel
-    /// virtual address requires understanding PDEs with the PS bit
-    /// set.
+    /// are used by the kernel direct map and the framebuffer
+    /// mapping, so translating a kernel virtual address requires
+    /// understanding PDEs with the PS bit set.
     ///
     /// Returns `None` if the virtual page is not mapped.
     pub fn translate(&self, virtual_address: u32) -> Option<u32> {

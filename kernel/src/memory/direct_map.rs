@@ -22,6 +22,15 @@ const PAGE_PRESENT: u32 = 1 << 0;
 const PAGE_WRITABLE: u32 = 1 << 1;
 const PAGE_SIZE: u32 = 1 << 7;
 
+/// Page-directory entry flag: cache the page.
+///
+/// Clearing this bit (which is what we do by *not* setting it)
+/// would normally mean the page is cacheable. Setting it disables
+/// caching for that page, which is required for MMIO regions like
+/// a framebuffer: writes must go directly to the device and not
+/// be buffered in the CPU cache.
+const PAGE_CACHE_DISABLE: u32 = 1 << 4;
+
 /// Installs the kernel's physical-memory window.
 ///
 /// The mapping is:
@@ -119,4 +128,48 @@ fn flush_tlb() {
     unsafe {
         control::write_cr3(cr3);
     }
+}
+
+/// Base virtual address of the framebuffer mapping.
+pub const FRAMEBUFFER_VIRTUAL_BASE: u32 = 0x40000000;
+
+/// Maps a physical range into the kernel's address space.
+///
+/// Used to make a linear framebuffer reachable. The range must be
+/// 4 MiB-aligned in length, or the last page will be over-mapped
+/// by up to 4 MiB.
+///
+/// The pages are mapped with PCD (cache disable) set, because the
+/// framebuffer is MMIO.
+pub fn map_mmio(phys: u32, size_bytes: u32) -> u32 {
+    let page_directory = paging::page_directory_address();
+    let page_directory_ptr = page_directory as *mut u32;
+
+    let first_pde = (FRAMEBUFFER_VIRTUAL_BASE >> 22) as usize;
+    let page_count = ((size_bytes + LARGE_PAGE_SIZE - 1) / LARGE_PAGE_SIZE) as usize;
+
+    // Fail silently if the range doesn't fit in the address space.
+    if first_pde + page_count > 768 {
+        return 0;
+    }
+
+    for index in 0..page_count {
+        let physical_page = phys + (index as u32) * LARGE_PAGE_SIZE;
+        let entry = physical_page
+            | PAGE_PRESENT
+            | PAGE_WRITABLE
+            | PAGE_SIZE
+            | PAGE_CACHE_DISABLE;
+
+        unsafe {
+            core::ptr::write_volatile(page_directory_ptr.add(first_pde + index), entry);
+        }
+    }
+
+    let cr3 = control::read_cr3();
+    unsafe {
+        control::write_cr3(cr3);
+    }
+
+    FRAMEBUFFER_VIRTUAL_BASE
 }

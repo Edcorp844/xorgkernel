@@ -399,15 +399,13 @@ unsafe impl GlobalAlloc for KernelAllocator {
             let heap = &mut *core::ptr::addr_of_mut!(HEAP);
             match heap {
                 Some(h) => {
-                    unsafe {
-                        marker(b'K');
-                    }
+                    marker(b'K');
+
                     h.alloc(layout)
                 }
                 None => {
-                    unsafe {
-                        marker(b'N');
-                    }
+                    marker(b'N');
+
                     core::ptr::null_mut()
                 }
             }

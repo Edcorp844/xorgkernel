@@ -36,7 +36,7 @@ static TICKS: AtomicU32 = AtomicU32::new(0);
 /// Number of ticks between "still alive" prints.
 ///
 /// At the PIT frequency used below (100 Hz), this prints once per
-/// second. Lower it to see more output, raise it to see less.
+/// second.
 const TICKS_PER_REPORT: u32 = 100;
 
 // ---------------------------------------------------------------------
@@ -63,9 +63,6 @@ const TICKS_PER_REPORT: u32 = 100;
 /// The bootstrap stack is *not* zeroed here: it is placed above
 /// `__kernel_end` in the linker script and this function runs on it.
 unsafe fn clear_bootstrap_regions() {
-    unsafe {
-        marker(b'Z');
-    }
     let start = arch::__bootstrap_start() as *mut u8;
     let end = arch::__kernel_end() as *mut u8;
     let size = (end as usize) - (start as usize);
@@ -76,25 +73,33 @@ unsafe fn clear_bootstrap_regions() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
+    // Zero the kernel's own regions, then copy the bootloader's
+    // information structure into a buffer in `.bss`. Both steps
+    // must happen before paging is enabled and before any other
+    // subsystem reads from `.bss`.
     unsafe {
         clear_bootstrap_regions();
         boot::multiboot2::init(multiboot_info);
     }
 
+    // Set up the early console sinks (serial and VGA text).
     console::init();
-    println!("multiboot_info = {:p}", multiboot_info);
-    println!("magic = 0x{:08x}", unsafe {
-        *(multiboot_info as *const u32)
-    });
-    println!("total_size = {}", unsafe {
-        *((multiboot_info as *const u32).add(1))
-    });
 
+    // Load the GDT and IDT, then enable paging and set up the
+    // direct map and frame allocator.
     cpu::gdt::init();
     cpu::idt::init();
     memory::paging::init();
     memory::direct_map::init();
+
+    // If the bootloader provided a linear framebuffer, register a
+    // framebuffer sink as well. From this point on, output fans
+    // out to serial, VGA text, and the framebuffer.
+    setup_framebuffer();
+
     memory::frame::init();
+
+    // Initialize the capability fabric.
     capability::init();
 
     // ---- Kernel heap. ----
@@ -118,7 +123,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     println!();
     println!("Kernel heap initialized.");
 
-    // ---- Existing substrate tests. ----
+    // ---- Substrate tests. ----
     //
     // These run with interrupts disabled. They exercise the
     // capability fabric and the address-space machinery and would
@@ -128,7 +133,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     test_cells();
     test_memory_object_allocation();
     test_map_memory();
-    test_heap(); // <-- add this line
+    test_heap();
     test_address_space();
     test_address_space_activation();
     test_kernel_mapping_sharing();
@@ -156,12 +161,66 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
 
     // ---- Idle. ----
     //
-    // The timer now ticks at the configured rate. The handler
-    // increments TICKS and prints periodically. `hlt` suspends the
-    // CPU until the next interrupt, which is the correct way to
-    // idle a kernel with nothing to do.
+    // The timer ticks at the configured rate. The handler
+    // increments TICKS and prints periodically. `hlt` suspends
+    // the CPU until the next interrupt, which is the correct way
+    // to idle a kernel with nothing to do.
     idle_loop()
 }
+
+/// Detects a framebuffer from the Multiboot2 information and
+/// registers it with the console.
+///
+/// Does nothing if the bootloader did not provide a linear RGB
+/// framebuffer.
+fn setup_framebuffer() {
+    let Some(info) = boot::multiboot2::framebuffer_info() else {
+        return;
+    };
+
+    let size_bytes = info.pitch * info.height;
+    let virt_base = crate::memory::direct_map::map_mmio(
+        info.address as u32,
+        size_bytes,
+    ) as *mut u8;
+
+    if virt_base.is_null() {
+        println!("Framebuffer: cannot map (address space exhausted)");
+        return;
+    }
+
+    // Diagnostic: write one pixel to confirm the mapping works.
+    unsafe {
+        core::ptr::write_volatile(virt_base as *mut u32, 0x0000FF00);
+    }
+
+    let bytes_per_pixel = (info.bpp as usize + 7) / 8;
+
+    let fb = unsafe {
+        console::framebuffer::Framebuffer::new(
+            virt_base,
+            info.pitch as usize,
+            info.width as usize,
+            info.height as usize,
+            bytes_per_pixel,
+            info.red_shift, info.red_size,
+            info.green_shift, info.green_size,
+            info.blue_shift, info.blue_size,
+        )
+    };
+
+    match fb {
+        Some(fb) => {
+            console::init_framebuffer(fb);
+            println!(
+                "Framebuffer console: {}x{} @ {} bpp (virt 0x{:08x})",
+                info.width, info.height, info.bpp, virt_base as u32
+            );
+        }
+        None => println!("Framebuffer present but not usable"),
+    }
+}
+
 
 /// Configures the PIC, PIT, and IRQ dispatch path, then enables
 /// interrupts.
@@ -212,8 +271,7 @@ fn idle_loop() -> ! {
 ///
 /// Called by the IRQ dispatch path each time the PIT fires. The
 /// handler runs with interrupts disabled (interrupt gates clear IF),
-/// so it must complete quickly; anything long should be deferred to
-/// a bottom half, which the kernel does not yet have.
+/// so it must complete quickly.
 ///
 /// Prints a running count once every `TICKS_PER_REPORT` ticks.
 fn on_timer_tick() {
@@ -230,10 +288,6 @@ fn on_timer_tick() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Print the panic message and location if the console is
-    // initialized. During early boot the console may not be
-    // ready, in which case the writes go nowhere, but by the
-    // time tests run it's fully functional.
     println!();
     println!("========================================");
     println!("           KERNEL PANIC");
@@ -269,7 +323,7 @@ fn test_address_space() {
     println!("  Initial mapping check: SUCCESS");
 
     println!("  Creating mapping...");
-    assert!(address_space.map(virtual_address, physical_address, true, false,));
+    assert!(address_space.map(virtual_address, physical_address, true, false));
     println!("  Mapping creation: SUCCESS");
 
     println!(
@@ -320,8 +374,6 @@ fn test_capability_transfer() {
 
     println!("  Object created: {}", object.raw());
 
-    // `SHARE` replaces the old `GRANT` right: a capability with
-    // `SHARE` can be delegated to produce a derived capability.
     let parent_rights = CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::SHARE;
 
     let parent = core
@@ -361,7 +413,6 @@ fn test_capability_transfer() {
 
     println!("  Excess-rights rejection: SUCCESS");
 
-    // A capability without SHARE cannot be delegated.
     let restricted = core
         .allocate(object, CapabilityRights::READ)
         .expect("restricted capability allocation failed");
@@ -408,28 +459,12 @@ fn test_cells() {
     println!("  Cell B: {}", cell_b.raw());
 }
 
-/// Tests the fabric's memory-object allocation path.
-///
-/// This exercises:
-///
-/// - `CapabilityCore::allocate_memory`, which allocates frames,
-///   creates a memory object, registers it, and returns a
-///   capability
-/// - `CapabilityCore::memory_object`, which resolves a capability
-///   back to the object
-/// - `CapabilityCore::lookup_object_kind`, which reports the
-///   object's kind
-/// - `CapabilityCore::transfer`, for deriving an attenuated
-///   capability
-/// - `CapabilityCore::destroy_object`, which revokes every
-///   capability and returns the object's frames
 fn test_memory_object_allocation() {
     println!();
     println!("Testing memory object allocation...");
 
     let core = capability::core_mut();
 
-    // Allocate a 4-page memory object with MAP | READ | WRITE.
     let rights = CapabilityRights::MAP
         | CapabilityRights::READ
         | CapabilityRights::WRITE
@@ -442,7 +477,6 @@ fn test_memory_object_allocation() {
     println!("  Object created: {}", object.raw());
     println!("  Capability:     0x{:08x}", cap.raw());
 
-    // The registry must report the object's kind.
     assert_eq!(
         core.lookup_object_kind(object),
         Some(ObjectKind::MemoryObject)
@@ -450,7 +484,6 @@ fn test_memory_object_allocation() {
 
     println!("  Object kind: MemoryObject: SUCCESS");
 
-    // The capability must carry the rights that were requested.
     assert!(core.has_rights(cap, CapabilityRights::MAP));
     assert!(core.has_rights(cap, CapabilityRights::READ));
     assert!(core.has_rights(cap, CapabilityRights::WRITE));
@@ -459,7 +492,6 @@ fn test_memory_object_allocation() {
 
     println!("  Rights: MAP|READ|WRITE|SHARE: SUCCESS");
 
-    // The memory object must be resolvable through the capability.
     let mem = core
         .memory_object(cap)
         .expect("memory object lookup failed");
@@ -473,7 +505,6 @@ fn test_memory_object_allocation() {
         println!("    Frame {}: 0x{:08x}", i, frame.address());
     }
 
-    // Derive an attenuated capability: READ only.
     let read_only = core
         .transfer(cap, CapabilityRights::READ)
         .expect("transfer failed");
@@ -484,8 +515,6 @@ fn test_memory_object_allocation() {
     println!("  Derived READ-only capability: 0x{:08x}", read_only.raw());
     println!("  Attenuation: SUCCESS");
 
-    // Destroy the object. Both capabilities must become invalid,
-    // and the frames must be returned to the frame allocator.
     assert!(core.destroy_object(object));
 
     assert!(core.lookup(cap).is_none());
@@ -572,7 +601,7 @@ fn test_address_space_activation() {
         virtual_address, physical_a
     );
 
-    assert!(space_a.map(virtual_address, physical_a, true, false,));
+    assert!(space_a.map(virtual_address, physical_a, true, false));
 
     println!("  Mapping B:");
     println!(
@@ -580,7 +609,7 @@ fn test_address_space_activation() {
         virtual_address, physical_b
     );
 
-    assert!(space_b.map(virtual_address, physical_b, true, false,));
+    assert!(space_b.map(virtual_address, physical_b, true, false));
 
     assert_eq!(space_a.translate(virtual_address), Some(physical_a));
     assert_eq!(space_b.translate(virtual_address), Some(physical_b));
@@ -665,7 +694,6 @@ fn test_map_memory() {
 
     let core = capability::core_mut();
 
-    // Allocate a memory object.
     let mem_rights = CapabilityRights::MAP
         | CapabilityRights::READ
         | CapabilityRights::WRITE
@@ -678,7 +706,6 @@ fn test_map_memory() {
     println!("  Memory object: {}", mo_id.raw());
     println!("  MO capability: 0x{:08x}", mo_cap.raw());
 
-    // Allocate an address space.
     let as_rights = CapabilityRights::MAP
         | CapabilityRights::UNMAP
         | CapabilityRights::ACTIVATE
@@ -691,7 +718,6 @@ fn test_map_memory() {
     println!("  Address space: {}", as_id.raw());
     println!("  AS capability: 0x{:08x}", as_cap.raw());
 
-    // Map the object into the address space.
     let va = 0x0080_0000;
 
     println!(
@@ -705,7 +731,6 @@ fn test_map_memory() {
 
     println!("  Mapping: SUCCESS");
 
-    // Verify the mapping through the address space.
     let aspace = core
         .address_space(as_cap)
         .expect("address space lookup failed");
@@ -729,14 +754,10 @@ fn test_map_memory() {
 
     println!("  Translation: SUCCESS");
 
-    // Mapping must fail if the caller lacks MAP on the address
-    // space. Derive a read-only capability and try again.
     let ro_as = core
         .transfer(as_cap, CapabilityRights::SHARE)
         .expect("AS capability derivation failed");
 
-    // `ro_as` still carries SHARE but has dropped MAP, UNMAP,
-    // ACTIVATE. Mapping with it must fail.
     let result = core.map_memory(ro_as, mo_cap, va + 0x10_0000, true, false);
 
     assert_eq!(result, Err(MapError::MissingAddressSpaceMapRight));
@@ -745,7 +766,6 @@ fn test_map_memory() {
 
     core.revoke(ro_as);
 
-    // Unmap the mapping.
     println!("  Unmapping...");
 
     for i in 0..4 {
@@ -768,7 +788,6 @@ fn test_map_memory() {
 
     println!("  Unmapping: SUCCESS");
 
-    // Destroy both objects. Their resources must be returned.
     assert!(core.destroy_object(as_id));
     assert!(core.destroy_object(mo_id));
 
@@ -778,15 +797,6 @@ fn test_map_memory() {
     println!("  Object-wide revocation: SUCCESS");
 }
 
-/// Tests the kernel heap by allocating through Rust's `alloc`
-/// types.
-///
-/// This exercises:
-///
-/// - the global allocator, which delegates to the heap
-/// - the bump allocator within a slab
-/// - slab growth, when the first slab is exhausted
-/// - the `map_memory` path, which the heap calls when it grows
 fn test_heap() {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
@@ -794,14 +804,12 @@ fn test_heap() {
     println!();
     println!("Testing kernel heap...");
 
-    // A single boxed value.
     let boxed = Box::new(42u32);
 
     assert_eq!(*boxed, 42);
 
     println!("  Box<u32> = {}: SUCCESS", *boxed);
 
-    // A vector that grows past one allocation.
     let mut vec: Vec<u64> = Vec::new();
 
     for i in 0..100 {
@@ -816,11 +824,6 @@ fn test_heap() {
 
     println!("  Vec<u64> with 100 elements: SUCCESS");
 
-    // A vector large enough to force a slab growth.
-    //
-    // Each u64 is 8 bytes; 100 000 elements is 800 KiB, well past
-    // the 256 KiB slab size. This forces the heap to call
-    // `grow` and install a second slab through the fabric.
     let mut big: Vec<u64> = Vec::new();
 
     for i in 0..100_000 {
@@ -833,7 +836,6 @@ fn test_heap() {
 
     println!("  Vec<u64> with 100 000 elements: SUCCESS");
 
-    // Report committed bytes.
     let committed = memory::heap::committed();
 
     println!(
@@ -843,18 +845,7 @@ fn test_heap() {
     );
     println!("  Kernel heap: SUCCESS");
 
-    // Prevent the compiler from eliding the allocations.
     core::hint::black_box(&boxed);
     core::hint::black_box(&vec);
     core::hint::black_box(&big);
-}
-
-unsafe fn marker(byte: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out 0xE9, al",
-            in("al") byte,
-            options(nostack, preserves_flags),
-        );
-    }
 }
