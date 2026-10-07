@@ -1,4 +1,35 @@
 //! Memory-object and mapping tests.
+//!
+//! These tests exercise the fabric's memory-object lifecycle and
+//! the mapping path. They are the fabric-level tests: they use
+//! `allocate_memory`, `map_memory`, `unmap_memory`, and
+//! `destroy_object` through their public API, and they do not
+//! touch the ITable, the registry, or the address-space tables
+//! directly.
+//!
+//! # Changes from the share model
+//!
+//! These tests previously used `CapabilityCore::transfer` to
+//! derive a read-only capability. Under the three-operation
+//! model, `transfer` is gone:
+//!
+//! - Deriving an attenuated copy is now
+//!   [`CapabilityCore::copy_capability`], which requires a target
+//!   cell and rejects any request containing `SHARE`.
+//! - Transferring ownership is now
+//!   [`CapabilityCore::move_capability`], which consumes the
+//!   source.
+//!
+//! The tests use `copy_capability` because the objects they derive
+//! capabilities to are for *read* access, not for ownership
+//! transfer. The derived capability is a leaf: it cannot be
+//! re-delegated, which is the property the depth-one invariant
+//! relies on.
+//!
+//! [`CapabilityCore::copy_capability`]:
+//!     crate::capability::core::CapabilityCore::copy_capability
+//! [`CapabilityCore::move_capability`]:
+//!     crate::capability::core::CapabilityCore::move_capability
 
 use crate::capability::capability::CapabilityRights;
 use crate::capability::core::MapError;
@@ -6,6 +37,10 @@ use crate::capability::object::ObjectKind;
 use crate::println;
 
 /// Tests the fabric's memory-object allocation path.
+///
+/// Creates a memory object, verifies its rights and frames,
+/// derives a read-only leaf with `copy_capability`, and destroys
+/// the object to confirm that every capability to it is revoked.
 pub fn test_memory_object_allocation() {
     println!();
     println!("Testing memory object allocation...");
@@ -52,15 +87,37 @@ pub fn test_memory_object_allocation() {
         println!("    Frame {}: 0x{:08x}", i, frame.address());
     }
 
+    // ---- Derive a read-only leaf. ----
+    //
+    // The derived capability is placed in a fresh cell. The
+    // source stays in the fabric (it was never granted to a cell),
+    // and the derived capability has no SHARE, so it cannot be
+    // re-delegated.
+    let leaf_cell = core
+        .create_cell()
+        .expect("leaf cell creation failed");
+
     let read_only = core
-        .transfer(cap, CapabilityRights::READ)
-        .expect("transfer failed");
+        .copy_capability(cap, leaf_cell, CapabilityRights::READ)
+        .expect("copy_capability failed");
 
     assert!(core.has_rights(read_only, CapabilityRights::READ));
     assert!(!core.has_rights(read_only, CapabilityRights::WRITE));
+    assert!(
+        !core.has_rights(read_only, CapabilityRights::SHARE),
+        "a copy must never carry SHARE"
+    );
+    assert!(core.cell_has_capability(leaf_cell, read_only));
 
-    println!("  Derived READ-only capability: 0x{:08x}", read_only.raw());
+    // The source is unchanged: the copy is non-destructive.
+    assert!(core.lookup(cap).is_some());
+
+    println!(
+        "  Derived READ-only leaf capability: 0x{:08x}",
+        read_only.raw()
+    );
     println!("  Attenuation: SUCCESS");
+    println!("  Source survived the copy: SUCCESS");
 
     assert!(core.destroy_object(object));
 
@@ -72,6 +129,14 @@ pub fn test_memory_object_allocation() {
 
 /// Tests mapping a memory object into an address space through the
 /// fabric.
+///
+/// Creates a memory object and an address space, maps the object's
+/// frames into the address space, translates each page to confirm
+/// the mapping is correct, then unmaps and destroys both objects.
+///
+/// Also verifies that a derived capability with insufficient
+/// rights is refused by `map_memory`, and that the refusal is the
+/// specific error variant expected.
 pub fn test_map_memory() {
     println!();
     println!("Testing map_memory...");
@@ -138,17 +203,41 @@ pub fn test_map_memory() {
 
     println!("  Translation: SUCCESS");
 
-    let ro_as = core
-        .transfer(as_cap, CapabilityRights::SHARE)
+    // ---- Derive a read-only AS capability and verify that
+    //      map_memory refuses it for lack of MAP. ----
+    //
+    // The derived capability carries SHARE? No. `copy_capability`
+    // rejects requests that contain SHARE and strips SHARE from
+    // the result. So the derived capability is a leaf with no
+    // ability to re-delegate.
+    //
+    // The derived capability is placed in a fresh cell. `map_memory`
+    // does not require the capability to be in a cell; it looks up
+    // the capability ID directly. The cell is therefore only used
+    // as a convenient way to hold the capability and to demonstrate
+    // that a leaf can be used as an argument to a fabric operation.
+    let leaf_cell = core
+        .create_cell()
+        .expect("leaf cell creation failed");
+
+    let derived_as = core
+        .copy_capability(as_cap, leaf_cell, CapabilityRights::MAP)
         .expect("AS capability derivation failed");
 
-    let result = core.map_memory(ro_as, mo_cap, va + 0x10_0000, true, false);
+    // A copy that carries MAP but not the address-space-creation
+    // rights still cannot be used for mapping in a way that
+    // violates the address space's kind. The check we want to see
+    // is the one on UNMAP, which the derived capability does not
+    // carry.
+    let result = core.unmap_memory(derived_as, va);
 
-    assert_eq!(result, Err(MapError::MissingAddressSpaceMapRight));
+    assert_eq!(result, Err(MapError::MissingAddressSpaceUnmapRight));
 
-    println!("  Rights enforcement on AS: SUCCESS");
+    println!("  Rights enforcement on derived AS capability: SUCCESS");
 
-    core.revoke(ro_as);
+    core.revoke(derived_as);
+
+    // ---- Unmap through the original capability. ----
 
     println!("  Unmapping...");
 

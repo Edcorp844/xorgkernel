@@ -286,4 +286,38 @@ impl ITable {
 
         revoked
     }
+
+    /// Returns `(object, rights)` for a live capability, or `None`
+    /// if the ID does not resolve.
+    ///
+    /// This is a convenience wrapper over `lookup` that copies the
+    /// fields out, so the caller does not hold a borrow on the table
+    /// when it subsequently calls `allocate` or `revoke`.
+    ///
+    /// The affine-move path needs this: it must read the source's
+    /// object and rights, then mutate the table twice. Borrowing
+    /// `&Capability` across those mutations is not possible.
+    pub fn lookup_parts(&self, id: CapabilityId) -> Option<(ObjectId, CapabilityRights)> {
+        self.lookup(id).map(|cap| (cap.object(), cap.rights()))
+    }
+
+    /// Returns the number of live capabilities referring to `object`.
+    ///
+    /// O(n) in the table size. Provided for tests and for the
+    /// affine-invariant assertion; not on the hot path.
+    ///
+    /// Once the per-object capability list exists, this becomes O(k).
+    pub fn count_capabilities_to(&self, object: ObjectId) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.occupied
+                    && entry
+                        .capability
+                        .as_ref()
+                        .map(|cap| cap.object() == object)
+                        .unwrap_or(false)
+            })
+            .count()
+    }
 }
