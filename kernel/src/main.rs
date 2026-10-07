@@ -12,10 +12,9 @@ mod capability;
 mod console;
 mod memory;
 mod sched;
-mod serial;
 mod sync;
 mod tests;
-mod vga;
+
 
 mod cpu;
 

@@ -37,8 +37,8 @@
 //! attempt to deliver interrupts. Until then, the PIC handles all
 //! hardware interrupts.
 
-use crate::serial::inb;
-use crate::serial::outb;
+use crate::console::serial::inb;
+use crate::console::serial::outb;
 
 /// I/O port of the master PIC's command register.
 const MASTER_COMMAND: u16 = 0x20;

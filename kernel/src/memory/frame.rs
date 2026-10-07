@@ -69,7 +69,7 @@
 //! support priority inheritance to avoid priority inversion.
 
 use crate::arch;
-use crate::memory::boot::{self, MemoryRegion};
+use crate::boot::info::{self, MemoryRegion};
 use crate::memory::direct_map;
 
 /// Size of a single physical frame, in bytes.
@@ -302,7 +302,7 @@ impl FrameAllocator {
 
     /// Phase 2: mark every frame in a usable E820 region as free.
     fn mark_usable_regions(&mut self) {
-        let map = boot::memory_map();
+        let map = info::memory_map();
 
         for region in map.usable_regions() {
             self.mark_region_usable(&region);
@@ -363,7 +363,7 @@ impl FrameAllocator {
         // Kernel image loaded by the bootloader. Covers .text,
         // .rodata, and .data; the linker also reports this range
         // via BootInfo.
-        let (kernel_start, kernel_end) = boot::kernel_range();
+        let (kernel_start, kernel_end) = info::kernel_range();
         self.reserve_range(kernel_start, kernel_end);
 
         // Everything the linker placed between __bootstrap_start

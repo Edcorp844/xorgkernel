@@ -32,7 +32,7 @@
 //! time reasonably accurately, infrequent enough not to dominate
 //! the CPU with interrupt overhead.
 
-use crate::serial::outb;
+use crate::console::serial::outb;
 
 /// I/O port of channel 0's data register.
 const CHANNEL_0_DATA: u16 = 0x40;
@@ -61,10 +61,7 @@ const COMMAND_CHANNEL_0_RATE_GENERATOR: u8 = 0x36;
 /// do that separately, after installing an IDT entry for the tick
 /// vector.
 pub fn init(frequency_hz: u32) {
-    assert!(
-        frequency_hz > 0,
-        "pit: frequency must be positive"
-    );
+    assert!(frequency_hz > 0, "pit: frequency must be positive");
 
     // Compute the divisor. If frequency_hz is very low, the divisor
     // may exceed the 16-bit range; clamp to the maximum and warn.
@@ -82,8 +79,7 @@ pub fn init(frequency_hz: u32) {
         println!(
             "pit: requested frequency {} Hz is above the maximum; \
              using {} Hz",
-            frequency_hz,
-            PIT_FREQUENCY
+            frequency_hz, PIT_FREQUENCY
         );
         1
     } else {

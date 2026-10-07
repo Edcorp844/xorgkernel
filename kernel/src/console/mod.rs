@@ -13,12 +13,14 @@
 
 use core::fmt::{self, Write};
 
-use crate::serial::SerialPort;
-use crate::sync::SpinLock;
-use crate::vga::VgaWriter;
+use crate::console::serial::SerialPort;
+use crate::sync::spinlock::SpinLock;
+use crate::console::vga::VgaWriter;
 
 pub mod font;
 pub mod framebuffer;
+pub mod serial;
+pub mod vga;
 
 use framebuffer::Framebuffer;
 
