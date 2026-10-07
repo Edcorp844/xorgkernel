@@ -143,6 +143,7 @@
 
 use crate::capability::capability::{Capability, CapabilityId, CapabilityRights};
 use crate::capability::cell::{Cell, CellId};
+use crate::capability::channel::{Channel, Message, MessageKind};
 use crate::capability::itable::ITable;
 use crate::capability::object::{ObjectId, ObjectKind};
 use crate::capability::registry::ObjectRegistry;
@@ -186,6 +187,34 @@ const MAX_MEMORY_OBJECTS: usize = 256;
 /// creation arrive, and the bound will be lifted when the tables
 /// become dynamic.
 const MAX_ADDRESS_SPACES: usize = 64;
+
+/// Maximum number of IPC channels managed by one capability
+/// domain.
+///
+/// A channel holds a fixed ring of [`crate::capability::channel::MAX_CHANNEL_MESSAGES`]
+/// messages at 28 bytes each, so one channel occupies about 900
+/// bytes. 64 channels is roughly 56 KiB, which is small enough for
+/// the bootstrap kernel and large enough that the tests and the
+/// boot sequence have headroom.
+///
+/// The bound is a fixed array size, not a design choice. When the
+/// fabric's tables become dynamic, the bound will be lifted.
+const MAX_CHANNELS: usize = 64;
+
+/// Maximum number of outstanding dequeued borrows the fabric
+/// tracks at once.
+///
+/// A "dequeued borrow" is a `BorrowIn` message that a borrower
+/// has received but not yet returned. The fabric tracks these so
+/// that a borrower's task exit can release the lender's slot,
+/// which would otherwise stay frozen forever.
+///
+/// 64 is chosen to match `MAX_CELLS`: in the current kernel each
+/// cell can have at most a small number of outstanding borrows,
+/// and 64 entries cover every cell having one borrow in flight
+/// simultaneously. The table is an array of `Option<OutstandingBorrow>`;
+/// each entry is 16 bytes, so the table is 1 KiB.
+const MAX_OUTSTANDING_BORROWS: usize = 64;
 
 /// Maximum number of frames `map_memory` can install in one call.
 ///
@@ -263,6 +292,42 @@ pub enum MapError {
     ObjectTooLarge,
 }
 
+/// A borrow that a cell has dequeued but not yet returned.
+///
+/// The fabric tracks these so that a borrower's task exit can
+/// release the lender's slot. Without this record, the fact that
+/// the borrower holds the message is invisible to the fabric: the
+/// message itself is a value in the borrower's context, and the
+/// channel's ring no longer contains it.
+///
+/// A record is created by [`CapabilityCore::recv_message`] when it
+/// returns a `BorrowIn` message, and removed by
+/// [`CapabilityCore::return_capability`] when the borrow is
+/// returned, or by [`CapabilityCore::break_borrows_for_cell`]
+/// when the borrower's task exits.
+#[derive(Clone, Copy)]
+struct OutstandingBorrow {
+    /// The cell that holds the dequeued message.
+    borrower: CellId,
+
+    /// The channel the message came from.
+    ///
+    /// Needed to remove the `BorrowIn` message from the channel's
+    /// ring when the borrow is returned or broken.
+    channel: ObjectId,
+
+    /// The capability the borrow is for.
+    ///
+    /// Matches the `capability` field of the `BorrowIn` message.
+    capability: CapabilityId,
+
+    /// The borrow's tag.
+    ///
+    /// Identifies the borrow uniquely within the channel. Used to
+    /// locate the message when returning or breaking.
+    tag: u32,
+}
+
 /// Central authority for objects, capabilities, memory, address
 /// spaces, and cells.
 ///
@@ -284,6 +349,20 @@ pub struct CapabilityCore {
     /// Address spaces managed by this capability domain.
     address_spaces: [Option<AddressSpace>; MAX_ADDRESS_SPACES],
 
+    /// IPC channels managed by this capability domain.
+    ///
+    /// A channel is an object; it holds the message ring. When a
+    /// channel object is destroyed, its `Drop` handler drops any
+    /// pending messages and reverts any capabilities they carried
+    /// to their original owners.
+    channels: [Option<Channel>; MAX_CHANNELS],
+
+    /// Outstanding dequeued borrows.
+    ///
+    /// See [`OutstandingBorrow`] and
+    /// [`CapabilityCore::recv_message`].
+    outstanding_borrows: [Option<OutstandingBorrow>; MAX_OUTSTANDING_BORROWS],
+
     /// Identifier assigned to the next newly created cell.
     next_cell_id: u32,
 }
@@ -297,6 +376,8 @@ impl CapabilityCore {
             cells: [const { None }; MAX_CELLS],
             memory_objects: [const { None }; MAX_MEMORY_OBJECTS],
             address_spaces: [const { None }; MAX_ADDRESS_SPACES],
+            channels: [const { None }; MAX_CHANNELS],
+            outstanding_borrows: [const { None }; MAX_OUTSTANDING_BORROWS],
             next_cell_id: 1,
         }
     }
@@ -334,22 +415,63 @@ impl CapabilityCore {
     ///
     /// If the object is a memory object, its frames are returned to
     /// the frame allocator. If it is an address space, its page
-    /// directory is returned. If it is a cell, its capabilities
-    /// are released.
+    /// directory is returned. If it is a channel, its pending
+    /// messages are cleaned up:
+    ///
+    /// - `Move` messages' capabilities are revoked. They have no
+    ///   owner: the sender's cell no longer holds them, and no
+    ///   receiver has dequeued them. The message ring is the sole
+    ///   holder, and destroying the channel drops that holder.
+    ///
+    /// - `BorrowIn` messages that are still in the ring have
+    ///   their lenders' slots reverted to `Owned`. The lender's
+    ///   slot was frozen when the borrow was made; releasing it
+    ///   before the message disappears is what prevents the slot
+    ///   from being stuck forever.
+    ///
+    /// - Outstanding-borrow records for this channel have their
+    ///   lenders' slots reverted and the records removed. These
+    ///   are borrows whose messages were dequeued by a borrower
+    ///   and not yet returned; the record is the fabric's
+    ///   knowledge of them.
     ///
     /// # Ordering
     ///
-    /// Capabilities are revoked before the object's storage is
-    /// dropped. This is required for memory safety: the object's
-    /// `Drop` implementation returns frames to the frame allocator,
-    /// and any cell still holding a capability to the object would
-    /// be holding a stale reference after the frames were reused.
-    /// The order is:
+    /// Channel cleanup happens *before* the capability revocation
+    /// loop at the bottom of this function. The order matters:
     ///
-    /// 1. Revoke every capability to the object.
-    /// 2. Remove the object's storage (`MemoryObject` or
-    ///    `AddressSpace`), which drops it and returns its frames.
-    /// 3. Mark the registry slot free.
+    /// 1. Walk the channel's ring and revoke every `Move` message's
+    ///    capability. These capabilities are held by the message,
+    ///    not by any cell, so revoking them here is the only way
+    ///    they are ever released. Doing this *before* the general
+    ///    `revoke_object` call below means that if a message's
+    ///    capability happens to refer to the same object being
+    ///    destroyed, the general revocation finds it already gone
+    ///    and skips it.
+    ///
+    /// 2. Walk the ring again and revert the lenders of every
+    ///    `BorrowIn` message still in the ring. The lender's
+    ///    `BorrowedOut` slot must be released before the channel
+    ///    is dropped; otherwise the slot is frozen forever.
+    ///
+    /// 3. Process every outstanding-borrow record for the channel.
+    ///    A record whose message is still in the ring was already
+    ///    handled by pass 2; a record whose message was dequeued
+    ///    but not returned is handled here. In both cases the
+    ///    lender's slot is reverted and the record is removed.
+    ///
+    /// 4. Revoke every remaining capability referring to the
+    ///    object. This catches the channel's own capability (the
+    ///    one the caller holds to reach the channel) and any
+    ///    other capabilities the fabric has allocated to the
+    ///    object.
+    ///
+    /// 5. Drop the object's storage: memory frames, page directory,
+    ///    or channel ring. The channel's `Drop` is trivial — it
+    ///    does not itself revoke anything — because steps 1
+    ///    through 3 have already done the cleanup.
+    ///
+    /// # Return value
     ///
     /// Returns `true` if the object existed and was destroyed.
     pub fn destroy_object(&mut self, object: ObjectId) -> bool {
@@ -357,7 +479,158 @@ impl CapabilityCore {
             return false;
         }
 
+        // ---- Channel-specific cleanup. ----
+
+        let is_channel = self.registry.kind(object) == Some(ObjectKind::Channel);
+
+        if is_channel {
+            // ---- Pass 1: revoke `Move` messages' capabilities. ----
+            //
+            // The scan collects capability IDs into a fixed-size
+            // stack buffer before revoking, so that we do not
+            // hold a borrow of the channel while mutating the
+            // ITable.
+            let mut to_revoke: [CapabilityId; crate::capability::channel::MAX_CHANNEL_MESSAGES] =
+                [CapabilityId::INVALID; crate::capability::channel::MAX_CHANNEL_MESSAGES];
+            let mut revoke_count = 0;
+
+            if let Some(channel) = self.channel(object) {
+                for offset in 0..channel.len() {
+                    let message = match channel.peek(offset) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+
+                    if message.kind == MessageKind::Move
+                        && message.capability != CapabilityId::INVALID
+                    {
+                        if revoke_count < to_revoke.len() {
+                            to_revoke[revoke_count] = message.capability;
+                            revoke_count += 1;
+                        }
+                    }
+                }
+            }
+
+            for i in 0..revoke_count {
+                self.itable.revoke(to_revoke[i]);
+            }
+
+            // ---- Pass 2: revert lenders of `BorrowIn` messages
+            //      still in the ring. ----
+            //
+            // The loop removes one `BorrowIn` message per iteration
+            // because `remove_borrow_in` shifts the ring;
+            // re-scanning from the start of the channel after each
+            // removal keeps the offsets correct.
+            loop {
+                let found = {
+                    let channel = match self.channel(object) {
+                        Some(ch) => ch,
+                        None => break,
+                    };
+
+                    let mut found: Option<(CapabilityId, u32)> = None;
+
+                    for offset in 0..channel.len() {
+                        let message = match channel.peek(offset) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+
+                        if message.kind == MessageKind::BorrowIn {
+                            found = Some((message.capability, message.tag));
+                            break;
+                        }
+                    }
+
+                    found
+                };
+
+                let (capability, tag) = match found {
+                    Some(t) => t,
+                    None => break,
+                };
+
+                let lender_cell = match lender_from_tag(tag) {
+                    Some(c) => c,
+                    None => break,
+                };
+
+                let removed = match self.channel_mut(object) {
+                    Some(channel) => channel.remove_borrow_in(capability, tag),
+                    None => false,
+                };
+
+                if !removed {
+                    break;
+                }
+
+                if let Some(cell) = self.cell_mut(lender_cell) {
+                    cell.revert_to_owned(capability);
+                }
+            }
+
+            // ---- Pass 3: process outstanding-borrow records. ----
+            //
+            // A record whose message is still in the ring was
+            // already handled by pass 2. A record whose message
+            // was dequeued but not returned is handled here: the
+            // lender's slot must be reverted before the record is
+            // removed, or the slot stays frozen forever.
+            //
+            // The records for this channel are collected first,
+            // then each is processed (revert lender, remove
+            // record). Collection-then-process avoids iterating
+            // the table while mutating it.
+            let mut to_clear: [Option<OutstandingBorrow>; MAX_OUTSTANDING_BORROWS] =
+                [None; MAX_OUTSTANDING_BORROWS];
+            let mut clear_count = 0;
+
+            for slot in self.outstanding_borrows.iter() {
+                if let Some(borrow) = slot {
+                    if borrow.channel == object && clear_count < to_clear.len() {
+                        to_clear[clear_count] = Some(*borrow);
+                        clear_count += 1;
+                    }
+                }
+            }
+
+            for i in 0..clear_count {
+                let borrow = match to_clear[i] {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                // Revert the lender's slot. The lender's cell is
+                // encoded in the borrow's tag.
+                if let Some(lender_cell) = lender_from_tag(borrow.tag) {
+                    if let Some(cell) = self.cell_mut(lender_cell) {
+                        cell.revert_to_owned(borrow.capability);
+                    }
+                }
+
+                // Remove the record.
+                self.remove_borrow_record(
+                    borrow.borrower,
+                    borrow.channel,
+                    borrow.capability,
+                    borrow.tag,
+                );
+            }
+        }
+
+        // ---- Revoke every capability referring to the object. ----
+        //
+        // This includes the channel's own capability (the caller's
+        // handle to it) and any other capabilities the fabric has
+        // allocated to the object. For a channel, this runs after
+        // the passes above; the `Move` messages' capabilities have
+        // already been revoked, so this call finds them gone and
+        // does not double-revoke them.
         self.itable.revoke_object(object);
+
+        // ---- Drop the object's storage. ----
 
         for slot in self.memory_objects.iter_mut() {
             if let Some(obj) = slot {
@@ -376,6 +649,17 @@ impl CapabilityCore {
                 }
             }
         }
+
+        for slot in self.channels.iter_mut() {
+            if let Some(channel) = slot {
+                if channel.id() == object {
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+
+        // ---- Free the registry slot. ----
 
         self.registry.destroy(object)
     }
@@ -659,7 +943,7 @@ impl CapabilityCore {
     /// shareable copy, and the mistake would surface later as a
     /// missing capability. Rejecting makes the mistake surface at
     /// the call site, which is where it belongs.
-    /// 
+    ///
     /// Note that the source's own `SHARE` bit is **not** checked.
     /// A capability without `SHARE` can still be copied; the
     /// result simply lacks `SHARE` as well, so it is also a leaf.
@@ -905,6 +1189,689 @@ impl CapabilityCore {
         }
 
         None
+    }
+
+    // =================================================================
+    // IPC channels
+    // =================================================================
+
+    /// Creates an IPC channel and returns a capability to it.
+    ///
+    /// The channel is an object, registered with the registry
+    /// like any other. The returned capability is the caller's to
+    /// move, copy, or grant to a cell; it is not automatically
+    /// placed anywhere.
+    ///
+    /// A newly created channel is empty and has no senders or
+    /// receivers. The caller is responsible for distributing
+    /// capabilities to the cells that should be able to use the
+    /// channel: a capability with `SEND` on the channel goes to
+    /// the sending cell, a capability with `RECV` goes to the
+    /// receiving cell, and the channel's owner retains a
+    /// capability with `DESTROY` (and usually nothing else).
+    ///
+    /// # Rights
+    ///
+    /// The `rights` argument is the rights the returned
+    /// capability carries. Callers that will grant the
+    /// capability to other cells should include `SHARE`, so that
+    /// `copy_capability` can derive attenuated copies for those
+    /// cells. A caller that keeps the capability for itself may
+    /// omit `SHARE`.
+    ///
+    /// # Return value
+    ///
+    /// `Some((ObjectId, CapabilityId))` on success. `None` if the
+    /// channel table is full, the registry is full, or the ITable
+    /// is full.
+    pub fn create_channel(&mut self, rights: CapabilityRights) -> Option<(ObjectId, CapabilityId)> {
+        let slot_index = self.channels.iter().position(|slot| slot.is_none())?;
+
+        let id = self.registry.create(ObjectKind::Channel)?;
+
+        let mut channel = Channel::new();
+        channel.set_id(id);
+        self.channels[slot_index] = Some(channel);
+
+        match self.itable.allocate(id, rights) {
+            Some(cap) => Some((id, cap)),
+            None => {
+                self.channels[slot_index] = None;
+                self.registry.destroy(id);
+                None
+            }
+        }
+    }
+
+    /// Sends a capability over a channel as a `Move` message.
+    ///
+    /// The source cell must hold the capability, and the
+    /// capability must be in the `Owned` state (a `BorrowedOut`
+    /// capability cannot be sent). The capability's ITable slot is
+    /// **consumed**: after a successful send, the source cell no
+    /// longer holds it and the capability ID is stale.
+    ///
+    /// The channel's ring receives a `Move` message carrying the
+    /// original capability ID. That ID is now valid for the
+    /// receiver: when the receiver dequeues the message, it
+    /// obtains the capability.
+    ///
+    /// # Why the ID survives the move
+    ///
+    /// Under the fabric's normal `move_capability` operation, the
+    /// source ID is revoked and the target gets a *fresh* ID. For
+    /// IPC, that would require the fabric to allocate a new ITable
+    /// slot for every message, and the message ring would carry
+    /// the fresh ID rather than the original.
+    ///
+    /// The IPC path takes a different route: it *does not* revoke
+    /// the source ID. Instead, it removes the ID from the source
+    /// cell's namespace and places the same ID in the message
+    /// ring. The ID's ITable slot remains live throughout; what
+    /// changes is which cell's namespace references it.
+    ///
+    /// This is not a weakening of the affine invariant. The
+    /// invariant is "at most one cell's namespace references this
+    /// capability ID." Sending moves the reference from the
+    /// source cell to the message ring, which is a kernel-side
+    /// holder, not a cell. When the receiver dequeues, the
+    /// reference moves from the message ring to the receiver's
+    /// cell. At every point, exactly one holder exists.
+    ///
+    /// The ITable slot's generation does not change, so the ID
+    /// remains valid. If the receiver never dequeues, the message
+    /// ring holds the ID until the channel is destroyed, at
+    /// which point the channel's `Drop` revokes every pending
+    /// message's capability.
+    ///
+    /// # Rights
+    ///
+    /// The channel capability must carry `SEND`. The sender's
+    /// cell is checked against the source cell parameter: the
+    /// capability must be in that cell. The source cell itself is
+    /// not otherwise validated; it is the caller's responsibility
+    /// to pass the correct one.
+    ///
+    /// # Return value
+    ///
+    /// `true` if the message was placed on the channel. `false` if:
+    ///
+    /// - the channel capability does not resolve, is not a
+    ///   channel, or lacks `SEND`;
+    /// - the source cell does not hold the capability;
+    /// - the capability is `BorrowedOut`;
+    /// - the channel is full.
+    ///
+    /// On failure, the source cell is unchanged.
+    pub fn send_capability(
+        &mut self,
+        channel_cap: CapabilityId,
+        source_cell: CellId,
+        capability: CapabilityId,
+    ) -> bool {
+        // 1. Resolve the channel capability and check SEND.
+        let channel_object = match self.lookup_checked(channel_cap) {
+            Some(cap) => {
+                if self.registry.kind(cap.object()) != Some(ObjectKind::Channel) {
+                    return false;
+                }
+                if !cap.rights().contains(CapabilityRights::SEND) {
+                    return false;
+                }
+                cap.object()
+            }
+            None => return false,
+        };
+
+        // 2. Verify the source cell holds the capability and is
+        //    not borrowed out.
+        match self.cell(source_cell) {
+            Some(cell) => {
+                if !cell.has_capability(capability) {
+                    return false;
+                }
+                if cell.borrow_state(capability)
+                    != Some(crate::capability::cell::BorrowState::Owned)
+                {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+
+        // 3. Verify the capability resolves in the ITable.
+        if self.lookup_checked(capability).is_none() {
+            return false;
+        }
+
+        // 4. Push the message. This is the only fallible step
+        //    that touches the channel; if the channel is full, we
+        //    return without touching the source cell.
+        let message = Message::move_capability(capability);
+
+        let pushed = match self.channel_mut(channel_object) {
+            Some(channel) => channel.push(message),
+            None => return false,
+        };
+
+        if !pushed {
+            return false;
+        }
+
+        // 5. Remove the capability from the source cell. This is
+        //    the "consume the source" step. The ITable slot
+        //    remains live; only the cell's reference to it goes
+        //    away.
+        if let Some(cell) = self.cell_mut(source_cell) {
+            cell.remove_capability(capability);
+        }
+
+        true
+    }
+
+    /// Receives a message from a channel.
+    ///
+    /// Pops the oldest message from the channel's ring and returns
+    /// it. The caller decides what to do with the message: for a
+    /// `Move` message, the caller typically places the capability
+    /// in its own cell with `grant_capability`; for a `BorrowIn`
+    /// message, the caller uses the capability and later returns
+    /// it with `return_capability`.
+    ///
+    /// The message is the residence of any capability it carries.
+    /// A received `Move` message's capability is *not* in any
+    /// cell until the receiver grants it. A received `BorrowIn`
+    /// message's capability is likewise not in any cell; the
+    /// borrower holds the message, uses the capability, and
+    /// returns it.
+    ///
+    /// # Borrower tracking
+    ///
+    /// When the dequeued message is a `BorrowIn`, the fabric
+    /// records the borrow in its outstanding-borrows table, keyed
+    /// by the borrower's cell. The record lets
+    /// [`CapabilityCore::break_borrows_for_cell`] release the
+    /// lender's slot if the borrower exits without returning.
+    ///
+    /// If the table is full, the receive is **declined**: the
+    /// message is pushed back onto the front of the channel's
+    /// ring and `None` is returned. An untracked borrow is a
+    /// borrow that cannot be cleaned up on task exit, and it is
+    /// better to fail the receive than to accept a borrow the
+    /// fabric cannot account for.
+    ///
+    /// Pushing the message back to the *front* (rather than
+    /// leaving it wherever the pop put it) preserves the
+    /// invariant that the ring's order is FIFO. The next
+    /// `recv_message` on the channel, by any receiver, will see
+    /// the same message.
+    ///
+    /// # Arguments
+    ///
+    /// `channel_cap` must resolve to a channel and carry `RECV`.
+    /// `borrower_cell` identifies the cell that is receiving.
+    /// It is used only for borrow tracking; a `Move` message's
+    /// receive does not consult it. Callers that receive from a
+    /// channel they do not own (which is unusual but not
+    /// forbidden) still must supply a cell ID for the record.
+    ///
+    /// # Return value
+    ///
+    /// `Some(message)` on success. `None` if:
+    ///
+    /// - the channel capability does not resolve, is not a
+    ///   channel, or lacks `RECV`;
+    /// - the channel is empty;
+    /// - the message is a `BorrowIn` and the borrow table is
+    ///   full.
+    pub fn recv_message(
+        &mut self,
+        channel_cap: CapabilityId,
+        borrower_cell: CellId,
+    ) -> Option<Message> {
+        let channel_object = match self.lookup_checked(channel_cap) {
+            Some(cap) => {
+                if self.registry.kind(cap.object()) != Some(ObjectKind::Channel) {
+                    return None;
+                }
+                if !cap.rights().contains(CapabilityRights::RECV) {
+                    return None;
+                }
+                cap.object()
+            }
+            None => return None,
+        };
+
+        // Pop the message.
+        let message = match self.channel_mut(channel_object) {
+            Some(channel) => channel.pop(),
+            None => return None,
+        }?;
+
+        // If the message is a borrow, record it. If the borrow
+        // table is full, push the message back and decline.
+        if message.kind == MessageKind::BorrowIn {
+            let borrow = OutstandingBorrow {
+                borrower: borrower_cell,
+                channel: channel_object,
+                capability: message.capability,
+                tag: message.tag,
+            };
+
+            if !self.record_borrow(borrow) {
+                // Push the message back onto the *front* of the
+                // ring. The pop removed it from the front; to
+                // restore it, we push all current messages
+                // forward by one slot and place the message at
+                // the head.
+                if let Some(channel) = self.channel_mut(channel_object) {
+                    channel.push_front(message);
+                }
+                return None;
+            }
+        }
+
+        Some(message)
+    }
+
+    /// Borrows a capability over a channel as a `BorrowIn` message.
+    ///
+    /// The source cell must hold the capability, and the
+    /// capability must be in the `Owned` state. On success:
+    ///
+    /// 1. The source cell's slot for the capability transitions to
+    ///    `BorrowedOut`. The slot is frozen: the capability cannot
+    ///    be moved, copied, or used until the borrow is returned.
+    ///
+    /// 2. A `BorrowIn` message is pushed onto the channel's ring.
+    ///    The message carries the capability ID and a *borrow tag*
+    ///    that encodes the lender's cell.
+    ///
+    /// The lender's capability ID does *not* leave the lender's
+    /// cell. The borrower sees the ID via the message; the lender
+    /// still holds the ID, but marked `BorrowedOut`. When the
+    /// borrower returns, the message is removed from the ring and
+    /// the lender's slot reverts to `Owned`.
+    ///
+    /// # Borrow tag encoding
+    ///
+    /// The tag is `(lender_cell_raw << 16) | counter`. The
+    /// counter is per-channel and monotonic. The encoding lets a
+    /// channel's `Drop` (or the fabric's `destroy_object`) find
+    /// the lender of an outstanding borrow without keeping a
+    /// separate ledger: extract the lender cell from the tag,
+    /// revert that cell's slot.
+    ///
+    /// The high 16 bits carry the lender's cell ID. The low 16
+    /// bits carry a counter that is per-channel and monotonic.
+    /// The counter skips 0, because a tag with a zero high half
+    /// cannot be decoded by [`lender_from_tag`] and would be
+    /// rejected by [`CapabilityCore::return_capability`].
+    ///
+    /// # Rights
+    ///
+    /// The channel capability must carry `SEND`.
+    ///
+    /// # Return value
+    ///
+    /// `Some(tag)` on success, where `tag` is the borrow's tag.
+    /// The caller uses the tag to match the eventual return.
+    ///
+    /// `None` if:
+    ///
+    /// - the channel capability does not resolve, is not a
+    ///   channel, or lacks `SEND`;
+    /// - the source cell does not hold the capability;
+    /// - the capability is already `BorrowedOut` (no nested
+    ///   borrows);
+    /// - the channel is full.
+    ///
+    /// On failure, the source cell is unchanged.
+    pub fn borrow_capability(
+        &mut self,
+        channel_cap: CapabilityId,
+        source_cell: CellId,
+        capability: CapabilityId,
+    ) -> Option<u32> {
+        // 1. Resolve the channel capability and check SEND.
+        let channel_object = match self.lookup_checked(channel_cap) {
+            Some(cap) => {
+                if self.registry.kind(cap.object()) != Some(ObjectKind::Channel) {
+                    return None;
+                }
+                if !cap.rights().contains(CapabilityRights::SEND) {
+                    return None;
+                }
+                cap.object()
+            }
+            None => return None,
+        };
+
+        // 2. Verify the source cell holds the capability.
+        match self.cell(source_cell) {
+            Some(cell) => {
+                if !cell.has_capability(capability) {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+
+        // 3. Verify the capability resolves.
+        if self.lookup_checked(capability).is_none() {
+            return None;
+        }
+
+        // 4. Generate the tag. The counter is per-channel; the
+        //    lender cell is packed into the high bits.
+        let counter = match self.channel_mut(channel_object) {
+            Some(channel) => channel.next_borrow_tag(),
+            None => return None,
+        };
+
+        let tag = ((source_cell.raw() & 0xffff) << 16) | (counter & 0xffff);
+
+        // 5. Transition the source cell's slot to BorrowedOut.
+        //    This is done before the message push so that if the
+        //    push fails, we can revert. If the push succeeds but
+        //    the transition had already failed, we would have an
+        //    inconsistent state.
+        let transitioned = match self.cell_mut(source_cell) {
+            Some(cell) => cell.borrow_out(capability),
+            None => return None,
+        };
+
+        if !transitioned {
+            return None;
+        }
+
+        // 6. Push the BorrowIn message.
+        let message = Message::borrow_in(capability, tag);
+
+        let pushed = match self.channel_mut(channel_object) {
+            Some(channel) => channel.push(message),
+            None => {
+                // Revert the transition. The channel was
+                // validated earlier, so this should not happen;
+                // if it does, revert and return.
+                if let Some(cell) = self.cell_mut(source_cell) {
+                    cell.revert_to_owned(capability);
+                }
+                return None;
+            }
+        };
+
+        if !pushed {
+            // Channel is full. Revert the transition.
+            if let Some(cell) = self.cell_mut(source_cell) {
+                cell.revert_to_owned(capability);
+            }
+            return None;
+        }
+
+        Some(tag)
+    }
+
+    /// Returns a borrowed capability.
+    ///
+    /// The borrower calls this after finishing its use of the
+    /// borrowed capability. The channel's ring is scanned for a
+    /// `BorrowIn` message with the given tag and capability; if
+    /// found, it is removed. The lender's cell is identified from
+    /// the tag, and the lender's slot reverts to `Owned`.
+    ///
+    /// The borrow's outstanding-borrow record (created by
+    /// [`CapabilityCore::recv_message`]) is removed as part of
+    /// the return.
+    ///
+    /// # Why the message must still be in the ring
+    ///
+    /// The borrow's residence is the channel's message ring. A
+    /// return requires the message to still be present: it
+    /// identifies the lender and the capability unambiguously.
+    ///
+    /// If the message is no longer in the ring, the borrow cannot
+    /// be returned by this operation. This happens in two cases:
+    ///
+    /// - The channel was destroyed, which drops the message and
+    ///   reverts the lender's slot. The return is a no-op: the
+    ///   borrow has already been broken.
+    ///
+    /// - The lender revoked the capability while it was borrowed.
+    ///   In this case, `revoke` cascades to the borrow, and the
+    ///   message is removed. The return is a no-op.
+    ///
+    /// In both cases, the operation is a safe no-op and returns
+    /// `false`.
+    ///
+    /// # Return value
+    ///
+    /// `true` if the message was found and the lender's slot
+    /// reverted to `Owned`. `false` otherwise.
+    /// Returns a borrowed capability.
+    ///
+    /// The borrower calls this after finishing its use of the
+    /// borrowed capability. The fabric uses its outstanding-borrow
+    /// record to identify the lender and the capability, reverts
+    /// the lender's slot to `Owned`, and removes the record.
+    ///
+    /// The `BorrowIn` message is *not* in the channel's ring at
+    /// this point: it was removed when the borrower called
+    /// [`CapabilityCore::recv_message`]. The record created by
+    /// that receive is the fabric's knowledge of the borrow; the
+    /// return consults the record, not the ring.
+    ///
+    /// # Why the ring is not consulted
+    ///
+    /// A `BorrowIn` message's lifetime is: pushed to the ring by
+    /// `borrow_capability`, popped from the ring by
+    /// `recv_message`. Once popped, the message lives in the
+    /// borrower's context. The fabric's `OutstandingBorrow` record
+    /// is what tracks the borrow after that point.
+    ///
+    /// The alternative — leaving the message in the ring and
+    /// peeking at it — would require `recv_message` to not remove
+    /// `BorrowIn` messages and would require additional state to
+    /// prevent double-receives. The record table already solves
+    /// that problem, and it keeps the ring's semantics simple: a
+    /// ring message is a message in transit, not a message in
+    /// use.
+    ///
+    /// # Return value
+    ///
+    /// `true` if a matching outstanding-borrow record was found
+    /// and the lender's slot reverted to `Owned`. `false` if no
+    /// record matched, which means the borrow was never
+    /// outstanding (already returned, or the message was never
+    /// received).
+    pub fn return_capability(
+        &mut self,
+        channel_cap: CapabilityId,
+        borrower_cell: CellId,
+        capability: CapabilityId,
+        tag: u32,
+    ) -> bool {
+        // 1. Resolve the channel capability. We do not strictly
+        //    need it for the return (the record identifies the
+        //    channel), but we check it to preserve the invariant
+        //    that a return is always scoped to a channel the
+        //    caller holds.
+        let channel_object = match self.lookup_checked(channel_cap) {
+            Some(cap) => {
+                if self.registry.kind(cap.object()) != Some(ObjectKind::Channel) {
+                    return false;
+                }
+                cap.object()
+            }
+            None => return false,
+        };
+
+        // 2. Identify the lender from the tag.
+        let lender_cell = match lender_from_tag(tag) {
+            Some(cell) => cell,
+            None => return false,
+        };
+
+        // 3. Remove the outstanding-borrow record. If no record
+        //    matches, the borrow was not outstanding: the caller
+        //    is either returning a borrow that was never made, or
+        //    returning the same borrow twice.
+        let removed = self.remove_borrow_record(borrower_cell, channel_object, capability, tag);
+
+        if !removed {
+            return false;
+        }
+
+        // 4. Revert the lender's slot to Owned.
+        if let Some(cell) = self.cell_mut(lender_cell) {
+            cell.revert_to_owned(capability);
+        }
+
+        true
+    }
+
+    /// Breaks every outstanding borrow held by or owed to a cell.
+    ///
+    /// Called by the scheduler when a task exits. The exiting
+    /// cell may be:
+    ///
+    /// - **A lender**: its capabilities include slots in the
+    ///   `BorrowedOut` state. Those slots have a matching
+    ///   `BorrowIn` message in some channel's ring. The borrow is
+    ///   broken: the message is removed, and the slot is reverted
+    ///   to `Owned`.
+    ///
+    /// - **A borrower**: it has dequeued one or more `BorrowIn`
+    ///   messages and not returned them. The outstanding-borrow
+    ///   table records these. Each is broken: the record is
+    ///   removed, and the lender's slot reverts to `Owned`. The
+    ///   message is not in the channel's ring — it was popped by
+    ///   [`CapabilityCore::recv_message`] — so no ring operation
+    ///   is performed for this direction.
+    ///
+    /// Both directions are handled because a borrow has two
+    /// participants, and either can exit.
+    ///
+    /// # Return value
+    ///
+    /// The number of borrows broken.
+    pub fn break_borrows_for_cell(&mut self, cell: CellId) -> usize {
+        let mut broken = 0;
+
+        // ---- Direction 1: the cell is a borrower. ----
+        //
+        // Scan the outstanding-borrows table for records whose
+        // borrower is `cell`. For each, remove the record and
+        // revert the lender's slot.
+        //
+        // The message is not removed from any channel's ring: it
+        // was already popped by `recv_message`, which is what
+        // created the record in the first place. The record is the
+        // fabric's knowledge of the borrow after that point.
+        //
+        // The records are collected into a fixed-size stack
+        // buffer before any mutation, so that we do not iterate
+        // the table while mutating it.
+        let mut borrower_records: [Option<OutstandingBorrow>; MAX_OUTSTANDING_BORROWS] =
+            [None; MAX_OUTSTANDING_BORROWS];
+        let mut borrower_count = 0;
+
+        for slot in self.outstanding_borrows.iter() {
+            if let Some(borrow) = slot {
+                if borrow.borrower == cell && borrower_count < borrower_records.len() {
+                    borrower_records[borrower_count] = Some(*borrow);
+                    borrower_count += 1;
+                }
+            }
+        }
+
+        for i in 0..borrower_count {
+            let borrow = match borrower_records[i] {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Remove the record. The ring is not consulted: the
+            // message is no longer in it.
+            self.remove_borrow_record(
+                borrow.borrower,
+                borrow.channel,
+                borrow.capability,
+                borrow.tag,
+            );
+
+            // Revert the lender's slot.
+            if let Some(lender_cell) = lender_from_tag(borrow.tag) {
+                if let Some(cell_ref) = self.cell_mut(lender_cell) {
+                    cell_ref.revert_to_owned(borrow.capability);
+                }
+            }
+
+            broken += 1;
+        }
+
+        // ---- Direction 2: the cell is a lender. ----
+        //
+        // Scan every channel's ring for `BorrowIn` messages whose
+        // lender is `cell`. For each, remove the message and
+        // revert the lender's slot.
+        //
+        // The loop removes one message per iteration because
+        // `remove_borrow_in` shifts the ring; re-scanning from
+        // the start of each channel after each removal keeps the
+        // offsets correct.
+        for channel_index in 0..self.channels.len() {
+            loop {
+                let (channel_object, found) = {
+                    let channel = match self.channels[channel_index].as_ref() {
+                        Some(ch) => ch,
+                        None => break,
+                    };
+
+                    let mut found: Option<(CapabilityId, u32)> = None;
+
+                    for offset in 0..channel.len() {
+                        let message = match channel.peek(offset) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+
+                        if message.kind != MessageKind::BorrowIn {
+                            continue;
+                        }
+
+                        let lender_is_exiting = match lender_from_tag(message.tag) {
+                            Some(lender) => lender == cell,
+                            None => false,
+                        };
+
+                        if lender_is_exiting {
+                            found = Some((message.capability, message.tag));
+                            break;
+                        }
+                    }
+
+                    (channel.id(), found)
+                };
+
+                let (capability, tag) = match found {
+                    Some(t) => t,
+                    None => break,
+                };
+
+                if let Some(channel) = self.channel_mut(channel_object) {
+                    if channel.remove_borrow_in(capability, tag) {
+                        broken += 1;
+
+                        if let Some(cell_ref) = self.cell_mut(cell) {
+                            cell_ref.revert_to_owned(capability);
+                        }
+                    }
+                }
+            }
+        }
+
+        broken
     }
 
     /// Maps a memory object into an address space.
@@ -1161,6 +2128,36 @@ impl CapabilityCore {
         self.cells.iter_mut().flatten().find(|cell| cell.id() == id)
     }
 
+    /// Returns a reference to a channel by ID.
+    ///
+    /// Returns `None` if no channel with that ID exists.
+    ///
+    /// This is a read-only accessor. It is public because tests
+    /// and diagnostics need to inspect a channel's ring without
+    /// consuming its messages, and there is no other way to reach
+    /// the channel's internals from outside the fabric. It does
+    /// not check any capability: it takes an `ObjectId`, which is
+    /// the fabric's internal name for the object, not a
+    /// `CapabilityId`, which is the caller's authority. A caller
+    /// that has an `ObjectId` is already inside the trust
+    /// boundary; a caller that has only a `CapabilityId` must go
+    /// through `recv_message` or a similar checked operation.
+    ///
+    /// The distinction matters. `channel(id: ObjectId)` reveals a
+    /// channel's internal state; `recv_message(cap: CapabilityId)`
+    /// checks `RECV` and mutates the ring. The former is for
+    /// inspection, the latter is for use.
+    pub fn channel(&self, id: ObjectId) -> Option<&Channel> {
+        self.channels.iter().flatten().find(|ch| ch.id() == id)
+    }
+
+    /// Returns a mutable reference to a channel by ID.
+    ///
+    /// Returns `None` if no channel with that ID exists.
+    fn channel_mut(&mut self, id: ObjectId) -> Option<&mut Channel> {
+        self.channels.iter_mut().flatten().find(|ch| ch.id() == id)
+    }
+
     /// Grants an existing capability to an execution cell.
     ///
     /// This is a raw grant: it adds the capability to the cell's
@@ -1258,4 +2255,93 @@ impl CapabilityCore {
 
         Some(new_cap)
     }
+
+    /// Records a dequeued borrow.
+    ///
+    /// Returns `true` if the record was added, `false` if the
+    /// table is full. A `false` return is a signal to the caller
+    /// that the borrow cannot be tracked, and it should decline
+    /// the receive: an untracked borrow is a borrow that a task
+    /// exit cannot clean up.
+    fn record_borrow(&mut self, borrow: OutstandingBorrow) -> bool {
+        for slot in self.outstanding_borrows.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(borrow);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Removes the outstanding-borrow record matching the given
+    /// fields.
+    ///
+    /// Returns `true` if a matching record was found and removed.
+    /// Matching is by `(borrower, channel, capability, tag)`, all
+    /// four fields, because a borrower can have multiple
+    /// outstanding borrows on the same channel with different
+    /// tags.
+    fn remove_borrow_record(
+        &mut self,
+        borrower: CellId,
+        channel: ObjectId,
+        capability: CapabilityId,
+        tag: u32,
+    ) -> bool {
+        for slot in self.outstanding_borrows.iter_mut() {
+            if let Some(borrow) = slot {
+                if borrow.borrower == borrower
+                    && borrow.channel == channel
+                    && borrow.capability == capability
+                    && borrow.tag == tag
+                {
+                    *slot = None;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Removes every outstanding-borrow record for a channel.
+    ///
+    /// Called by `destroy_object` when a channel is destroyed.
+    /// The channel's pending messages are being cleaned up, so
+    /// the records that reference it are now meaningless.
+    ///
+    /// Returns the number of records removed.
+    fn remove_borrow_records_for_channel(&mut self, channel: ObjectId) -> usize {
+        let mut removed = 0;
+
+        for slot in self.outstanding_borrows.iter_mut() {
+            if let Some(borrow) = slot {
+                if borrow.channel == channel {
+                    *slot = None;
+                    removed += 1;
+                }
+            }
+        }
+
+        removed
+    }
+}
+
+/// Extracts the lender cell from a borrow tag.
+///
+/// Borrow tags are constructed by [`CapabilityCore::borrow_capability`]
+/// as `(lender_cell_raw << 16) | counter`. This function reverses
+/// the encoding.
+///
+/// Returns `None` if the tag's high bits are zero, which means
+/// the tag was not generated by `borrow_capability`.
+fn lender_from_tag(tag: u32) -> Option<CellId> {
+    let raw = (tag >> 16) & 0xffff;
+
+    if raw == 0 {
+        return None;
+    }
+
+    Some(CellId::new(raw))
 }

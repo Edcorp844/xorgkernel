@@ -80,4 +80,21 @@ pub enum ObjectKind {
     /// Rights that are meaningful: `ENTER`, `GRANT`, `REVOKE`,
     /// `SHARE`, `DESTROY`.
     Cell,
+
+    /// An inter-process communication channel.
+    ///
+    /// A channel is a bounded FIFO of fixed-size messages. Each
+    /// message can carry a capability (moved or borrowed), a small
+    /// payload, or both. Channels are how authority and data move
+    /// between cells.
+    ///
+    /// Rights that are meaningful: `SEND`, `RECV`, `SHARE`,
+    /// `DESTROY`.
+    ///
+    /// See [`crate::capability::channel`] for the design rationale.
+    /// The channel object is fabric-owned, not cell-owned: a cell
+    /// reaches it through a capability, and the fabric checks
+    /// `SEND` or `RECV` on that capability before allowing the
+    /// corresponding operation.
+    Channel,
 }

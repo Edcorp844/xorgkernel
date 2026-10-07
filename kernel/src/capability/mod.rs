@@ -61,6 +61,7 @@
 
 pub mod capability;
 pub mod cell;
+pub mod channel;
 pub mod core;
 pub mod itable;
 pub mod object;

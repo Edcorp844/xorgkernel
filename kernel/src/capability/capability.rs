@@ -137,6 +137,13 @@ impl CapabilityId {
 /// - `REVOKE`    remove a capability from the cell
 /// - `SHARE`     derive a new capability
 /// - `DESTROY`   terminate the cell
+/// 
+///  # Channels
+///
+/// - `SEND`      place a message on the channel
+/// - `RECV`      take a message off the channel
+/// - `SHARE`     derive a new capability
+/// - `DESTROY`   destroy the channel
 ///
 /// The fabric rejects a capability whose rights are not all
 /// meaningful for the object's kind.
@@ -214,6 +221,35 @@ impl CapabilityRights {
 
     /// Authority to remove a capability from a cell.
     pub const REVOKE: Self = Self(1 << 10);
+
+    // ---- Rights meaningful for channels. ----
+
+    /// Authority to place a message on a channel.
+    ///
+    /// A capability with `SEND` may be used as the first argument
+    /// to [`CapabilityCore::send_capability`] and
+    /// [`CapabilityCore::borrow_capability`]. It does not imply
+    /// `RECV`: a cell can be allowed to write to a channel without
+    /// being allowed to read from it, which is the natural
+    /// arrangement for a request-only endpoint.
+    ///
+    /// [`CapabilityCore::send_capability`]:
+    ///     crate::capability::core::CapabilityCore::send_capability
+    /// [`CapabilityCore::borrow_capability`]:
+    ///     crate::capability::core::CapabilityCore::borrow_capability
+    pub const SEND: Self = Self(1 << 11);
+
+    /// Authority to take a message off a channel.
+    ///
+    /// A capability with `RECV` may be used as the argument to
+    /// [`CapabilityCore::recv_message`]. It does not imply `SEND`:
+    /// a cell can be allowed to read from a channel without being
+    /// allowed to write to it, which is the natural arrangement
+    /// for a response-only endpoint.
+    ///
+    /// [`CapabilityCore::recv_message`]:
+    ///     crate::capability::core::CapabilityCore::recv_message
+    pub const RECV: Self = Self(1 << 12);
 
     /// Returns a rights value with no bits set.
     pub const fn empty() -> Self {

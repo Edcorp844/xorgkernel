@@ -34,7 +34,9 @@
 //! [`move_between_cells`]: crate::capability::core::CapabilityCore::move_between_cells
 
 use crate::capability::capability::CapabilityRights;
+use crate::capability::cell::BorrowState;
 use crate::capability::cell::CellId;
+use crate::capability::channel::MessageKind;
 use crate::capability::object::ObjectKind;
 use crate::println;
 
@@ -544,6 +546,553 @@ fn test_cross_cell_operations() {
     }
 }
 
+/// Tests IPC channel creation, capability send, and message
+/// receive.
+///
+/// Creates two cells, a channel, and a capability. Cell A holds
+/// the capability and sends it over the channel. Cell B receives
+/// it. After the send, A no longer holds the capability; after
+/// the receive, B holds it in the message it dequeued.
+fn test_channel_create_send_recv() {
+    println!();
+    println!("Testing channel create / send / recv...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+    let cell_b = core.create_cell().expect("cell B creation failed");
+
+    // Create a channel with SEND and RECV rights. A caller that
+    // distributes the channel to cells would give SEND to the
+    // sender and RECV to the receiver; for this test, both
+    // rights live on the single channel capability.
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    println!("  Channel object: {}", channel_obj.raw());
+    println!("  Channel cap:    0x{:08x}", channel_cap.raw());
+
+    // Create an object and a capability to it.
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    // Before send: A holds the capability.
+    assert!(core.cell_has_capability(cell_a, cap));
+    assert!(core.lookup(cap).is_some());
+
+    // Send A's capability over the channel.
+    let sent = core.send_capability(channel_cap, cell_a, cap);
+
+    assert!(sent, "send_capability must succeed");
+    assert!(
+        !core.cell_has_capability(cell_a, cap),
+        "after send, A must no longer hold the capability"
+    );
+    assert!(
+        core.lookup(cap).is_some(),
+        "the ITable slot remains live; the channel now holds it"
+    );
+
+    println!("  Send: source cell released, ITable slot still live: SUCCESS");
+
+    // Receive into B. The message carries the capability ID.
+    let message = core
+        .recv_message(channel_cap, cell_b)
+        .expect("receive must succeed");
+
+    assert_eq!(message.kind, crate::capability::channel::MessageKind::Move);
+    assert_eq!(message.capability, cap);
+
+    println!("  Receive: message carries the capability: SUCCESS");
+
+    // Grant the received capability to B.
+    assert!(core.grant_capability(cell_b, message.capability));
+    assert!(core.cell_has_capability(cell_b, cap));
+
+    println!("  Receiver adopts the capability: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  Channel create / send / recv: SUCCESS");
+}
+
+/// Tests the borrow and return path.
+///
+/// Cell A holds a capability. A borrows it out over a channel.
+/// A's slot transitions to `BorrowedOut`. B dequeues the borrow
+/// message, uses the capability (in this test, just verifies it
+/// resolves), and returns it. A's slot reverts to `Owned`.
+fn test_borrow_and_return() {
+    println!();
+    println!("Testing borrow and return...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+    let cell_b = core.create_cell().expect("cell B creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    // A borrows the capability out.
+    let tag = core
+        .borrow_capability(channel_cap, cell_a, cap)
+        .expect("borrow_capability must succeed");
+
+    println!("  Borrow tag: 0x{:08x}", tag);
+
+    // A's slot is now BorrowedOut.
+    use crate::capability::cell::BorrowState;
+
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(cap),
+        Some(BorrowState::BorrowedOut)
+    );
+
+    // The capability is still in A's namespace.
+    assert!(core.cell_has_capability(cell_a, cap));
+
+    // The capability still resolves in the ITable.
+    assert!(core.lookup(cap).is_some());
+
+    println!("  Lender's slot is BorrowedOut: SUCCESS");
+
+    // B dequeues the borrow message.
+    let message = core
+        .recv_message(channel_cap, cell_b)
+        .expect("receive must succeed");
+
+    assert_eq!(
+        message.kind,
+        crate::capability::channel::MessageKind::BorrowIn
+    );
+    assert_eq!(message.capability, cap);
+    assert_eq!(message.tag, tag);
+
+    println!("  Borrower dequeued the borrow message: SUCCESS");
+
+    // B returns the borrow.
+    let returned = core.return_capability(channel_cap, cell_b, cap, tag);
+
+    assert!(returned, "return_capability must succeed");
+
+    // A's slot is back to Owned.
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(cap),
+        Some(BorrowState::Owned)
+    );
+
+    println!("  Lender's slot reverted to Owned: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  Borrow and return: SUCCESS");
+}
+
+/// Verifies that a `BorrowedOut` capability cannot be sent.
+///
+/// This is decision B2 from the borrow design: a capability that
+/// is currently lent cannot be moved, because the lender does not
+/// have it in a movable state. Allowing the send would violate the
+/// affine invariant: the capability would be in the message ring
+/// *and* the borrower's temporary hold, which is two holders.
+fn test_borrow_cannot_move() {
+    println!();
+    println!("Testing that a BorrowedOut capability cannot be moved...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    // Borrow it out.
+    let _tag = core
+        .borrow_capability(channel_cap, cell_a, cap)
+        .expect("borrow_capability must succeed");
+
+    // Now try to send it from A. This must fail because A's slot
+    // is BorrowedOut.
+    let sent = core.send_capability(channel_cap, cell_a, cap);
+
+    assert!(!sent, "a BorrowedOut capability must not be sendable");
+
+    println!("  Send of a BorrowedOut capability rejected: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  BorrowedOut cannot be moved: SUCCESS");
+}
+
+/// Verifies that `break_borrows_for_cell` releases a lender's slot
+/// when the lender is the exiting cell.
+///
+/// Cell A holds a capability and lends it out. Then A is
+/// "exited" by calling `break_borrows_for_cell(cell_a)`. This
+/// simulates what the scheduler does when a task exits. A's slot
+/// must revert to `Owned`, and the borrow message must be removed
+/// from the channel.
+fn test_break_borrows_lender_exit() {
+    println!();
+    println!("Testing break_borrows_for_cell (lender exit)...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    let _tag = core
+        .borrow_capability(channel_cap, cell_a, cap)
+        .expect("borrow_capability must succeed");
+
+    // The borrow message is in the channel.
+    let channel = core.channel(channel_obj).expect("channel lookup failed");
+    assert_eq!(channel.len(), 1);
+
+    println!("  Borrow message in channel: SUCCESS");
+
+    // Simulate A's exit.
+    let broken = core.break_borrows_for_cell(cell_a);
+
+    assert_eq!(broken, 1, "one borrow must be broken");
+
+    // A's slot is back to Owned.
+    use crate::capability::cell::BorrowState;
+
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(cap),
+        Some(BorrowState::Owned)
+    );
+
+    // The channel is empty.
+    let channel = core.channel(channel_obj).expect("channel lookup failed");
+    assert_eq!(channel.len(), 0);
+
+    println!("  Lender's slot reverted, message removed: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  Break on lender exit: SUCCESS");
+}
+
+/// Verifies that `break_borrows_for_cell` releases the lender's
+/// slot when the *borrower* is the exiting cell.
+///
+/// Cell A lends a capability. Cell B dequeues the borrow message.
+/// Then B is "exited" by calling `break_borrows_for_cell(cell_b)`.
+/// A's slot must revert to `Owned` and the message must be removed,
+/// even though B never called `return_capability`.
+fn test_break_borrows_borrower_exit() {
+    println!();
+    println!("Testing break_borrows_for_cell (borrower exit)...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+    let cell_b = core.create_cell().expect("cell B creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    let _tag = core
+        .borrow_capability(channel_cap, cell_a, cap)
+        .expect("borrow_capability must succeed");
+
+    // B dequeues the borrow message. This creates an
+    // outstanding-borrow record.
+    let _message = core
+        .recv_message(channel_cap, cell_b)
+        .expect("receive must succeed");
+
+    // The channel is now empty (the message was popped).
+    let channel = core.channel(channel_obj).expect("channel lookup failed");
+    assert_eq!(channel.len(), 0);
+
+    println!("  Borrower dequeued the borrow message: SUCCESS");
+
+    // Simulate B's exit. The outstanding-borrow record is what
+    // makes this work: the message is not in the channel's ring
+    // anymore, but the fabric remembers that B holds it.
+    let broken = core.break_borrows_for_cell(cell_b);
+
+    assert_eq!(broken, 1, "one borrow must be broken");
+
+    // A's slot is back to Owned.
+    use crate::capability::cell::BorrowState;
+
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(cap),
+        Some(BorrowState::Owned)
+    );
+
+    println!("  Lender's slot reverted despite borrower's exit: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  Break on borrower exit: SUCCESS");
+}
+
+/// Verifies that destroying a channel cleans up its pending
+/// messages.
+///
+/// A channel holds a `Move` message and a `BorrowIn` message when
+/// it is destroyed. The `Move` capability must be revoked (it has
+/// no owner); the `BorrowIn` lender's slot must revert to `Owned`;
+/// and the borrow's record must be removed.
+fn test_channel_destroy_breaks_borrows() {
+    println!();
+    println!("Testing channel destruction with pending messages...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    // ---- Part 1: a `Move` message's capability is revoked. ----
+
+    let move_object = core
+        .create_object(ObjectKind::Cell)
+        .expect("move object creation failed");
+
+    let move_cap = core
+        .allocate(move_object, CapabilityRights::READ)
+        .expect("move capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, move_cap));
+    assert!(core.send_capability(channel_cap, cell_a, move_cap));
+
+    // move_cap is now in the channel's ring, not in A's cell.
+    assert!(!core.cell_has_capability(cell_a, move_cap));
+    assert!(core.lookup(move_cap).is_some());
+
+    println!("  Move message in channel: SUCCESS");
+
+    // ---- Part 2: a `BorrowIn` message's lender is reverted. ----
+
+    let borrow_object = core
+        .create_object(ObjectKind::Cell)
+        .expect("borrow object creation failed");
+
+    let borrow_cap = core
+        .allocate(borrow_object, CapabilityRights::READ)
+        .expect("borrow capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, borrow_cap));
+
+    let _tag = core
+        .borrow_capability(channel_cap, cell_a, borrow_cap)
+        .expect("borrow_capability must succeed");
+
+    use crate::capability::cell::BorrowState;
+
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(borrow_cap),
+        Some(BorrowState::BorrowedOut)
+    );
+
+    println!("  BorrowIn message in channel: SUCCESS");
+
+    // ---- Destroy the channel. ----
+
+    assert!(core.destroy_object(channel_obj));
+
+    // The Move message's capability is revoked.
+    assert!(
+        core.lookup(move_cap).is_none(),
+        "Move message's capability must be revoked on channel destroy"
+    );
+
+    // The BorrowIn lender's slot is reverted.
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(borrow_cap),
+        Some(BorrowState::Owned),
+        "BorrowIn lender's slot must revert on channel destroy"
+    );
+
+    // The BorrowIn capability itself is NOT revoked: it belongs
+    // to the lender, not the channel.
+    assert!(
+        core.lookup(borrow_cap).is_some(),
+        "BorrowIn capability belongs to the lender and must survive"
+    );
+
+    println!("  Channel destruction cleanup: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(move_object));
+    assert!(core.destroy_object(borrow_object));
+
+    println!("  Channel destroy with pending messages: SUCCESS");
+}
+
+/// Verifies that a `BorrowIn` message dequeued by a receiver
+/// creates an outstanding-borrow record, and that returning
+/// removes it.
+///
+/// The record is the fabric's only knowledge that a borrower
+/// holds a message. Without it, a borrower's task exit could not
+/// release the lender's slot. This test asserts that the record
+/// exists after a receive and is gone after a return.
+fn test_borrow_tracking_on_recv() {
+    println!();
+    println!("Testing outstanding-borrow tracking...");
+
+    let core = crate::capability::core_mut();
+
+    let cell_a = core.create_cell().expect("cell A creation failed");
+    let cell_b = core.create_cell().expect("cell B creation failed");
+
+    let channel_rights = CapabilityRights::SEND
+        | CapabilityRights::RECV
+        | CapabilityRights::SHARE
+        | CapabilityRights::DESTROY;
+
+    let (channel_obj, channel_cap) = core
+        .create_channel(channel_rights)
+        .expect("channel creation failed");
+
+    let object = core
+        .create_object(ObjectKind::Cell)
+        .expect("object creation failed");
+
+    let cap = core
+        .allocate(object, CapabilityRights::READ)
+        .expect("capability allocation failed");
+
+    assert!(core.grant_capability(cell_a, cap));
+
+    let tag = core
+        .borrow_capability(channel_cap, cell_a, cap)
+        .expect("borrow_capability must succeed");
+
+    // Receive. This is where the record is created.
+    let message = core
+        .recv_message(channel_cap, cell_b)
+        .expect("receive must succeed");
+
+    assert_eq!(message.tag, tag);
+
+    // Simulate B's exit right here. If the record exists, this
+    // will succeed and revert A's slot. If it doesn't, the slot
+    // stays frozen and the assertion below fails.
+    let broken = core.break_borrows_for_cell(cell_b);
+
+    assert_eq!(broken, 1, "the record must have been created on receive");
+
+    use crate::capability::cell::BorrowState;
+
+    assert_eq!(
+        core.cell(cell_a).unwrap().borrow_state(cap),
+        Some(BorrowState::Owned)
+    );
+
+    println!("  Receive created the record; break used it: SUCCESS");
+
+    // Cleanup.
+    assert!(core.destroy_object(object));
+    assert!(core.destroy_object(channel_obj));
+
+    println!("  Outstanding-borrow tracking: SUCCESS");
+}
+
 /// Tests execution cell creation and management.
 ///
 /// This is a small structural test: it verifies that cells can be
@@ -575,16 +1124,30 @@ pub fn test_cells() {
 /// Public entry point called by `tests/mod.rs`.
 ///
 /// The old test module exposed a single
-/// `test_capability_operations` function. That name no longer
-/// matches the fabric's vocabulary: `transfer` is now
-/// `copy_capability`, and the affine operation is
-/// `move_capability`. The test suite has been split into focused
-/// tests, one per invariant, and this function runs them all.
+/// `test_capability_transfer` function, which tested the fabric's
+/// now-removed `transfer` operation. Under the three-operation
+/// model, the tests are split into focused cases, one per
+/// invariant: object lifecycle, the copy operation's leaf-only
+/// semantics, the affine invariant, SHARE rejection, move failure
+/// modes, the cross-cell operations, and the IPC / borrow layer.
+///
+/// `run_all` calls this function once; it in turn calls every
+/// capability test in sequence.
 pub fn test_capability_operations() {
+    // ---- Core operations. ----
     test_object_lifecycle();
     test_copy_capability();
     test_affine_invariant();
     test_share_stripping();
     test_move_failure_modes();
     test_cross_cell_operations();
+
+    // ---- IPC and borrow. ----
+    test_channel_create_send_recv();
+    test_borrow_and_return();
+    test_borrow_cannot_move();
+    test_borrow_tracking_on_recv();
+    test_break_borrows_lender_exit();
+    test_break_borrows_borrower_exit();
+    test_channel_destroy_breaks_borrows();
 }

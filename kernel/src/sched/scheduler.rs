@@ -351,25 +351,61 @@ impl Scheduler {
 
     /// Marks a task as `Dead` and removes it from the scheduler.
     ///
-    /// The kernel stack and other resources are released when
-    /// the `Box<Task>` is dropped. After this call, the task's
-    /// ID no longer names anything, and any raw pointer obtained
+    /// The kernel stack and other resources are released when the
+    /// `Box<Task>` is dropped. After this call, the task's ID
+    /// no longer names anything, and any raw pointer obtained
     /// from `task_ptr` is dangling.
     ///
     /// # Order of operations
     ///
-    /// 1. If the task is `Ready`, remove it from its run queue
+    /// 1. **Break the task's outstanding borrows.** If the task
+    ///    was the lender of a capability over an IPC channel, the
+    ///    lender's slot must be reverted before the task's cell
+    ///    is dropped. This happens first because it needs the
+    ///    cell's borrow state, which is destroyed in step 4.
+    ///
+    ///    The break is done by the fabric, through
+    ///    [`CapabilityCore::break_borrows_for_cell`], which scans
+    ///    every channel's ring for `BorrowIn` messages whose
+    ///    lender is the exiting task's cell. See that method's
+    ///    documentation for the two directions of a borrow and
+    ///    which one is handled at task exit.
+    ///
+    /// 2. If the task is `Ready`, remove it from its run queue
     ///    and clear the `active` bit if the queue becomes empty.
     ///    A task in `Running` or `Blocked` state is already
     ///    absent from every run queue, so no removal is needed.
     ///
-    /// 2. Mark the task `Dead`. This is done before removing it
+    /// 3. Mark the task `Dead`. This is done before removing it
     ///    from the all-tasks list because `Task::is_linked_in_all`
     ///    is not a reliable membership test for a singleton list,
     ///    and the state is the authoritative signal.
     ///
-    /// 3. Remove the task from the all-tasks list and drop the
-    ///    box.
+    /// 4. Remove the task from the all-tasks list and drop the
+    ///    box. The drop frees the kernel stack. The cell itself
+    ///    is *not* dropped here: it is owned by the fabric, not
+    ///    by the task, and its lifetime is the fabric's
+    ///    responsibility. See the note on cell ownership below.
+    ///
+    /// # Cell ownership
+    ///
+    /// The task holds a `CellId`, not a `Cell`. The cell lives in
+    /// the fabric's cell table. When a task exits, the fabric is
+    /// *not* automatically told to destroy the cell — a cell can
+    /// outlive a task (for example, if a parent creates a cell
+    /// and hands it to a child, the parent may still hold a
+    /// reference to it after the child exits).
+    ///
+    /// The caller of `exit` is responsible for destroying the
+    /// cell if it should not outlive the task. In the current
+    /// kernel, no caller destroys cells on task exit; the cells
+    /// created in `kernel_main` and in the test suite live for
+    /// the kernel's lifetime. When a real `exit` syscall exists,
+    /// it will need to decide whether to destroy the exiting
+    /// task's cell, and that decision belongs in the syscall
+    /// handler, not here.
+    ///
+    /// # The `current` field
     ///
     /// The `current` field is not touched. If the caller is
     /// reaping the currently-running task (which would mean the
@@ -388,6 +424,36 @@ impl Scheduler {
         let task = unsafe { &mut *task_ptr };
         let priority_index = task.priority as usize;
 
+        // ---- Step 1: break the task's outstanding borrows. ----
+        //
+        // The task's cell may have slots in the `BorrowedOut`
+        // state. Each corresponds to a `BorrowIn` message in some
+        // channel's ring. Breaking the borrows releases the
+        // lender slots back to `Owned` and removes the messages.
+        //
+        // This must run before the cell's storage is dropped.
+        // The cell is owned by the fabric and is not dropped
+        // here, but the borrow state lives in the cell, and the
+        // fabric's `break_borrows_for_cell` reads it. If the
+        // cell is destroyed first (by a future caller that
+        // decides to clean up on exit), the borrow state is gone
+        // and the borrow cannot be broken.
+        let cell = task.cell;
+
+        if cell.is_valid() {
+            let core = crate::capability::core_mut();
+            let broken = core.break_borrows_for_cell(cell);
+
+            if broken > 0 {
+                println!(
+                    "scheduler: broke {} borrow(s) for exiting task '{}'",
+                    broken, task.name
+                );
+            }
+        }
+
+        // ---- Step 2: remove from the run queue if Ready. ----
+
         if task.state == TaskState::Ready {
             unsafe {
                 self.run_queues[priority_index].remove(task_ptr);
@@ -397,7 +463,11 @@ impl Scheduler {
             }
         }
 
+        // ---- Step 3: mark Dead. ----
+
         task.state = TaskState::Dead;
+
+        // ---- Step 4: remove from the all-tasks list and drop. ----
 
         unsafe {
             self.all_tasks.remove(task_ptr);
