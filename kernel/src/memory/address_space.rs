@@ -542,6 +542,65 @@ impl AddressSpace {
         Some(physical_page | offset)
     }
 
+    /// Translates a virtual address and checks that the mapping is
+    /// user-accessible.
+    ///
+    /// Same as [`AddressSpace::translate`], but returns `None` if
+    /// the containing page is not marked with the `USER` bit on
+    /// both the page-directory entry and the page-table entry. Used
+    /// by the syscall dispatcher to validate user-supplied buffers
+    /// before the kernel dereferences them.
+    ///
+    /// The check is deliberately strict: a page whose PDE has the
+    /// `USER` bit but whose PTE does not (or vice versa) is treated
+    /// as not user-accessible. The two bits must agree for a page
+    /// to be reachable from CPL 3.
+    pub fn translate_user(&self, virtual_address: u32) -> Option<u32> {
+        let directory_index = page_directory_index(virtual_address);
+        let table_index = page_table_index(virtual_address);
+
+        let page_directory = direct_map::phys_to_virt(self.page_directory) as *const u32;
+
+        let directory_entry =
+            unsafe { core::ptr::read_volatile(page_directory.add(directory_index)) };
+
+        if directory_entry & PAGE_PRESENT == 0 {
+            return None;
+        }
+
+        // The PDE must have the USER bit set for a CPL-3 access to
+        // be permitted. A 4 MiB page also requires USER on the PDE;
+        // there is no separate PTE to check.
+        if directory_entry & PAGE_USER == 0 {
+            return None;
+        }
+
+        if directory_entry & PAGE_SIZE_4MB != 0 {
+            let physical_base = directory_entry & 0xffc0_0000;
+            let offset = virtual_address & 0x003f_ffff;
+            return Some(physical_base | offset);
+        }
+
+        let table_address = directory_entry & !PAGE_OFFSET_MASK;
+
+        let page_table = direct_map::phys_to_virt(table_address) as *const u32;
+
+        let entry = unsafe { core::ptr::read_volatile(page_table.add(table_index)) };
+
+        if entry & PAGE_PRESENT == 0 {
+            return None;
+        }
+
+        if entry & PAGE_USER == 0 {
+            return None;
+        }
+
+        let physical_page = entry & !PAGE_OFFSET_MASK;
+        let offset = virtual_address & PAGE_OFFSET_MASK;
+
+        Some(physical_page | offset)
+    }
+
     /// Returns whether a virtual address is currently mapped in this
     /// address space.
     pub fn is_mapped(&self, virtual_address: u32) -> bool {

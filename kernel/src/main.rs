@@ -303,7 +303,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     //
     // The user task runs alongside the kernel tasks. Its cell is
     // empty; Session 4 will give it capabilities.
-    let user_setup = usermode::setup_session_3_user_space();
+    let user_setup = usermode::setup_session_5_user_space();
 
     match user_setup {
         Some((user_as_cap, _user_code_obj, _user_stack_obj, user_entry)) => {

@@ -1,21 +1,29 @@
 //! User-mode infrastructure tests.
 //!
 //! These tests verify the descriptors and the TSS that user mode
-//! will use. They do **not** enter user mode: that is a later
-//! change. At this point the descriptors exist and the TSS is
-//! loaded; the tests confirm they are correct.
+//! uses, and exercise the syscall dispatcher from ring 0.
 //!
 //! # What's tested
 //!
 //! - The GDT has six entries, with the expected selectors.
-//! - The TSS descriptor's base points at the TSS structure.
-//! - The TSS's `ss0` is the kernel data selector.
-//! - The TSS's `esp0` is updated when the scheduler switches
-//!   tasks (tested by reading it before and after a switch, if a
-//!   switch can be simulated).
+//! - The TSS descriptor points at the TSS structure.
+//! - The syscall dispatcher's fallback path returns
+//!   `ERR_NOSYS` for an unrecognized syscall number.
+//! - `SYS_SELF_CELL` returns `ERR_INVALID` when the caller has
+//!   no cell (which is the case for the bootstrap context that
+//!   runs these tests).
+//!
+//! The tests run before the scheduler starts. They exercise the
+//! ring-0 path of the syscall gate only; the ring-3 path is
+//! exercised by the user task that runs after the scheduler takes
+//! over.
 
 use crate::cpu::{gdt, tss};
 use crate::println;
+
+// ---------------------------------------------------------------------
+// Descriptor tests
+// ---------------------------------------------------------------------
 
 /// Verifies that the GDT is loaded and the TSS descriptor points
 /// at the TSS structure.
@@ -31,22 +39,16 @@ pub fn test_gdt_and_tss_loaded() {
 
     println!("  TSS address: 0x{:08x}", tss_address);
 
-    // The TSS's ss0 must be the kernel data selector. This is set
-    // by `tss::init`, which runs before `gdt::init`.
-    //
-    // We do not have a direct accessor for `ss0`; add one if this
-    // assertion is desired. For now, the test verifies that the
-    // TSS is reachable and the kernel is running with the GDT
-    // loaded.
-
-    // The TSS's esp0 must be non-zero after the first context
-    // switch. Since this test runs before the scheduler starts,
-    // esp0 is the placeholder set by `tss::init`. It becomes a
-    // real stack top when `schedule_and_switch` runs.
+    // The TSS's esp0 is a placeholder (zero) at this point in the
+    // boot. It becomes a real stack top when the scheduler
+    // performs its first context switch.
     let esp0 = tss::kernel_stack();
     println!("  TSS esp0 (initial): 0x{:08x}", esp0);
 
-    // The selectors must have the expected values.
+    // The selectors must have the expected values. A change to any
+    // of them breaks user mode: CS/SS for ring 3 must have RPL 3,
+    // and the TSS selector must match the GDT entry loaded with
+    // `ltr`.
     assert_eq!(gdt::KERNEL_CODE_SELECTOR, 0x08);
     assert_eq!(gdt::KERNEL_DATA_SELECTOR, 0x10);
     assert_eq!(gdt::USER_CODE_SELECTOR, 0x18);
@@ -60,68 +62,87 @@ pub fn test_gdt_and_tss_loaded() {
     println!("  GDT and TSS loaded: SUCCESS");
 }
 
-/// Verifies that the TSS's `esp0` is updated on a context switch.
+// ---------------------------------------------------------------------
+// Syscall dispatcher tests (ring 0)
+// ---------------------------------------------------------------------
+
+/// Tests that an unrecognized syscall number returns `ERR_NOSYS`.
 ///
-/// This test is called from a task, after the scheduler has run at
-/// least once. It reads `esp0`, yields, and reads it again. If the
-/// scheduler updated it, the value may have changed (another task
-/// may have a different kernel stack top).
-///
-/// The assertion is intentionally weak: `esp0` might be the same
-/// value if the task yielded to itself, and it might differ if the
-/// task yielded to another. What the test verifies is that `esp0`
-/// is *some* valid kernel stack top, not the placeholder zero.
-pub fn test_tss_esp0_updated() {
+/// The dispatcher's fallback branch returns `-3` (`ERR_NOSYS`) for
+/// any syscall number it does not recognize. This test invokes
+/// `int 0x80` with an unrecognized number from ring 0 and checks
+/// that the status code in EAX is `-3`.
+pub fn test_unknown_syscall_from_ring_0() {
     println!();
-    println!("Testing TSS esp0 updates across a switch...");
+    println!("Testing unknown syscall from ring 0...");
 
-    let esp0 = tss::kernel_stack();
-
-    assert!(
-        esp0 != 0,
-        "TSS esp0 must be set by the scheduler's first switch"
-    );
-
-    println!("  TSS esp0 after switch: 0x{:08x}", esp0);
-    println!("  TSS esp0 update: SUCCESS");
-}
-
-/// Invokes `int 0x80` from ring 0 and verifies the handler runs
-/// and returns.
-///
-/// The syscall gate is DPL 3, which means *ring 3 and ring 0* can
-/// both invoke it. From ring 0, the CPU pushes a 3-dword frame
-/// (no SS/ESP), and the stub does not normalize. The Rust handler
-/// reads the saved CS, sees RPL 0, and skips the user-only fields.
-///
-/// This test verifies the ring-0 path works before Session 3 adds
-/// the ring-3 path. If it fails, the gate, the stub, or the frame
-/// layout is wrong; Session 3 cannot succeed until this passes.
-pub fn test_syscall_from_ring_0() {
-    println!();
-    println!("Testing int 0x80 from ring 0...");
-
-    // Set up EAX with a recognizable syscall number so the
-    // handler's diagnostic shows it.
     let syscall_number: u32 = 0xABCD;
-    let return_value: u32;
+    let status: u32;
+    let value: u32;
 
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            inout("eax") syscall_number => return_value,
+            inout("eax") syscall_number => status,
+            out("edx") value,
             options(nostack, preserves_flags),
         );
     }
 
-    // The handler returns 0 in EAX for now. If Session 2's
-    // handler were to change its return value, this assertion
-    // would catch it.
+    // `-3` as `u32` is `0xFFFF_FFFD`. The dispatcher writes the
+    // `i32` status into the frame's EAX slot, and `popal` restores
+    // it into EAX. The caller sees the raw bit pattern.
     assert_eq!(
-        return_value, 0,
-        "syscall handler must return 0 in Session 2"
+        status, 0xFFFF_FFFD,
+        "unknown syscall must return ERR_NOSYS (-3)"
     );
 
-    println!("  Handler returned: 0x{:08x}", return_value);
-    println!("  Ring-0 syscall: SUCCESS");
+    // The value register is unspecified on error. Do not assert on
+    // it; the ABI makes no promise about its contents when the
+    // status is non-zero.
+    let _ = value;
+
+    println!("  Status: 0x{:08x} (ERR_NOSYS)", status);
+    println!("  Unknown syscall returns ERR_NOSYS: SUCCESS");
+}
+
+/// Tests `SYS_SELF_CELL` from ring 0.
+///
+/// The ring-0 caller is the bootstrap context, which has no cell.
+/// The dispatcher's `sys_self_cell` looks up the current task
+/// through the scheduler; for the bootstrap context this is the
+/// task with id 0, whose cell is `CellId::INVALID`. The dispatcher
+/// returns `ERR_INVALID` in that case.
+///
+/// This is a controlled exercise of the dispatcher's argument and
+/// return-value paths, and it confirms that the current-task
+/// lookup path in the scheduler works.
+pub fn test_self_cell_from_ring_0() {
+    println!();
+    println!("Testing SYS_SELF_CELL from ring 0...");
+
+    let syscall_number: u32 = 3; // SYS_SELF_CELL
+    let status: u32;
+    let value: u32;
+
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("eax") syscall_number => status,
+            out("edx") value,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    // The bootstrap context has no cell, so the dispatcher returns
+    // `ERR_INVALID` (-2). `-2` as `u32` is `0xFFFF_FFFE`.
+    assert_eq!(
+        status, 0xFFFF_FFFE,
+        "SYS_SELF_CELL from the bootstrap context must return ERR_INVALID"
+    );
+
+    let _ = value;
+
+    println!("  Status: 0x{:08x} (ERR_INVALID)", status);
+    println!("  SYS_SELF_CELL from bootstrap: SUCCESS");
 }

@@ -139,7 +139,8 @@ pub fn run_all() {
     capability::test_capability_operations();
     capability::test_cells();
     user_mode::test_gdt_and_tss_loaded();
-    user_mode::test_syscall_from_ring_0();
+    user_mode::test_unknown_syscall_from_ring_0();
+    user_mode::test_self_cell_from_ring_0();
     memory::test_memory_object_allocation();
     memory::test_map_memory();
     heap::test_heap();

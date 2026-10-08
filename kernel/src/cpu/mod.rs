@@ -14,5 +14,6 @@ pub mod pic;
 pub mod pit;
 pub mod speculate;
 pub mod syscall;
+pub mod syscall_abi;
 pub mod tss;
 pub mod usermode;

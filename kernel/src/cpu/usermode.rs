@@ -152,45 +152,66 @@ unsafe extern "C" {
     pub fn iret_to_user() -> !;
 }
 
-// ---------------------------------------------------------------------
-// Session 3 user blob
-// ---------------------------------------------------------------------
-
-/// A minimal user code blob.
+/// The user code blob for Session 5.
 ///
-/// The blob is hand-assembled 32-bit x86 that does the following:
+/// The blob exercises the three syscalls implemented in this
+/// session. It is hand-assembled 32-bit x86; the encoding of each
+/// instruction is documented in the comments.
 ///
-/// ```asm
-///     mov eax, 0x1234     ; syscall number, for the trace
-///     int 0x80            ; syscall — traps to CPL 0
-///     jmp $               ; loop forever
-/// ```
+/// # What it does
 ///
-/// Its purpose is to prove the CPL 3 transition works: the user
-/// task enters at CPL 3, executes `int 0x80`, and the kernel sees
-/// a trap whose saved `CS` has RPL 3. Session 4 will replace this
-/// with code loaded from a real file, but for now the blob is the
-/// smallest thing that demonstrates the transition.
+/// 1. `SYS_DEBUG_WRITE` with a pointer to a "hello" string and its
+///    length. The kernel validates the buffer against the user
+///    address space and prints it.
+/// 2. `SYS_SELF_CELL`, to verify that a syscall can return a value
+///    in EDX. The value is ignored by the blob; the observable
+///    evidence is the absence of an error status.
+/// 3. `SYS_YIELD`, to give up the CPU and let the scheduler run
+///    another task. The blob resumes when rescheduled.
+/// 4. An infinite loop, so the task stays alive and continues to
+///    be preempted by the timer.
 ///
-/// # Encoding
+/// The string is embedded in the blob at a known offset. The blob
+/// is copied into the user code page by `write_blob_into_object`,
+/// so the string is at `USER_CODE_BASE + offset`, and the `mov ebx`
+/// instruction loads that absolute address.
+///
+/// # Layout
 ///
 /// ```text
-///     mov eax, 0x00001234    B8 34 12 00 00    (5 bytes)
-///     int 0x80               CD 80             (2 bytes)
-///     jmp $                  EB FE             (2 bytes)
+///   offset  bytes                       meaning
+///   0x00    B8 01 00 00 00              mov eax, SYS_DEBUG_WRITE
+///   0x05    BB <ptr>                    mov ebx, msg_addr
+///   0x0A    B9 <len>                    mov ecx, msg_len
+///   0x0F    CD 80                       int 0x80
+///   0x11    B8 03 00 00 00              mov eax, SYS_SELF_CELL
+///   0x16    CD 80                       int 0x80
+///   0x18    B8 02 00 00 00              mov eax, SYS_YIELD
+///   0x1D    CD 80                       int 0x80
+///   0x1F    EB FE                       jmp $
+///   0x21    "hello from user mode\n"    the message
 /// ```
 ///
-/// Total: 9 bytes. The array is padded to 16 bytes so that future
-/// edits can add instructions without recomputing the length, and
-/// so the blob is a full dword-multiple for any future copy loop
-/// that moves it a dword at a time.
-pub const SESSION_3_BLOB: [u8; 16] = [
-    0xB8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
-    0xCD, 0x80, // int 0x80
-    0xEB, 0xFE, // jmp $
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+/// The `mov ebx, msg_addr` and `mov ecx, msg_len` instructions are
+/// patched at runtime by `setup_session_5_user_space` before the
+/// blob is copied into the code page. The initial encoding in the
+/// array has zeros in those fields; the runtime patch fills them
+/// with the correct address and length.
+pub const SESSION_5_BLOB: [u8; 64] = [
+    // 0x00: mov eax, SYS_DEBUG_WRITE (1)
+    0xB8, 0x01, 0x00, 0x00, 0x00, // 0x05: mov ebx, <msg address>  (patched at runtime)
+    0xBB, 0x00, 0x00, 0x00, 0x00, // 0x0A: mov ecx, <msg length>   (patched at runtime)
+    0xB9, 0x00, 0x00, 0x00, 0x00, // 0x0F: int 0x80
+    0xCD, 0x80, // 0x11: mov eax, SYS_SELF_CELL (3)
+    0xB8, 0x03, 0x00, 0x00, 0x00, // 0x16: int 0x80
+    0xCD, 0x80, // 0x18: mov eax, SYS_YIELD (2)
+    0xB8, 0x02, 0x00, 0x00, 0x00, // 0x1D: int 0x80
+    0xCD, 0x80, // 0x1F: jmp $ (infinite loop)
+    0xEB, 0xFE, // 0x21: message (21 bytes)
+    b'h', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm', b' ', b'u', b's', b'e', b'r', b' ',
+    b'm', b'o', b'd', b'e', b'\n', // padding to 64 bytes: 64 - 33 - 21 = 10 zeros
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
-
 /// Writes a byte blob into the physical frames of a memory object.
 ///
 /// The memory object must have at least `blob.len()` bytes of
@@ -301,33 +322,63 @@ pub const USER_STACK_SIZE: u32 = 4096;
 /// Returns `None` on any allocation failure. Partial state is
 /// rolled back: an address space created for a task that cannot be
 /// fully set up is destroyed before returning.
-pub fn setup_session_3_user_space() -> Option<(CapabilityId, ObjectId, ObjectId, UserEntry)> {
-    let core = crate::capability::core_mut();
+/// Sets up a Session 5 user address space.
+///
+/// Same as the Session 3 setup, but patches the `mov ebx, imm32`
+/// and `mov ecx, imm32` instructions in the blob so that they load
+/// the correct absolute address and length of the message string.
+///
+/// The message string is embedded in the blob at a known offset.
+/// Because the blob is copied into the user code page at
+/// `USER_CODE_BASE`, the runtime address of the string is
+/// `USER_CODE_BASE + MESSAGE_OFFSET`.
+pub fn setup_session_5_user_space() -> Option<(CapabilityId, ObjectId, ObjectId, UserEntry)> {
+    /// Offset of the message string within the blob.
+    const MESSAGE_OFFSET: u32 = 0x21;
 
-    // ---- 1. Code object. ----
-    //
-    // One page. The blob is 16 bytes, but a page is the smallest
-    // unit the memory-object allocator manages, and the extra
-    // space is unused.
+    /// Length of the message string, in bytes.
+    const MESSAGE_LENGTH: u32 = 21;
+
+    /// Offset of the `mov ebx, imm32` instruction's immediate.
+    const EBX_IMM_OFFSET: usize = 0x06;
+
+    /// Offset of the `mov ecx, imm32` instruction's immediate.
+    const ECX_IMM_OFFSET: usize = 0x0B;
+
+    let core = crate::capability::core_mut();
 
     let code_rights = CapabilityRights::MAP | CapabilityRights::READ;
     let (code_obj, code_cap) = core.allocate_memory(1, code_rights)?;
 
-    // Write the blob into the code object's first frame.
-    //
-    // We hold the memory-object reference just long enough to
-    // copy; the object lives in the fabric's table, so the
-    // reference is valid until the object is destroyed.
+    // Build the patched blob on the kernel stack.
+    let mut patched = SESSION_5_BLOB;
+
+    let message_address = USER_CODE_BASE + MESSAGE_OFFSET;
+    let message_length = MESSAGE_LENGTH;
+
+    // Patch `mov ebx, imm32`.
+    patched[EBX_IMM_OFFSET + 0] = (message_address & 0xFF) as u8;
+    patched[EBX_IMM_OFFSET + 1] = ((message_address >> 8) & 0xFF) as u8;
+    patched[EBX_IMM_OFFSET + 2] = ((message_address >> 16) & 0xFF) as u8;
+    patched[EBX_IMM_OFFSET + 3] = ((message_address >> 24) & 0xFF) as u8;
+
+    // Patch `mov ecx, imm32`.
+    patched[ECX_IMM_OFFSET + 0] = (message_length & 0xFF) as u8;
+    patched[ECX_IMM_OFFSET + 1] = ((message_length >> 8) & 0xFF) as u8;
+    patched[ECX_IMM_OFFSET + 2] = ((message_length >> 16) & 0xFF) as u8;
+    patched[ECX_IMM_OFFSET + 3] = ((message_length >> 24) & 0xFF) as u8;
+
+    // Write the patched blob into the code object's first frame.
     {
         let mem = core
             .memory_object(code_cap)
             .expect("just-created memory object must resolve");
-        write_blob_into_object(mem, &SESSION_3_BLOB);
+        write_blob_into_object(mem, &patched);
     }
 
-    // ---- 2. Stack object. ----
-    //
-    // One page, user-writable.
+    // From here, the same sequence as Session 3: allocate the
+    // stack object, allocate the address space, map both, build
+    // the UserEntry.
 
     let stack_rights = CapabilityRights::MAP | CapabilityRights::READ | CapabilityRights::WRITE;
     let (stack_obj, stack_cap) = match core.allocate_memory(1, stack_rights) {
@@ -337,8 +388,6 @@ pub fn setup_session_3_user_space() -> Option<(CapabilityId, ObjectId, ObjectId,
             return None;
         }
     };
-
-    // ---- 3. Address space. ----
 
     let as_rights = CapabilityRights::MAP
         | CapabilityRights::UNMAP
@@ -353,16 +402,6 @@ pub fn setup_session_3_user_space() -> Option<(CapabilityId, ObjectId, ObjectId,
             return None;
         }
     };
-
-    // ---- 4. Map code and stack into the address space. ----
-    //
-    // Both mappings are user-accessible (`user = true`), so the
-    // CPU will allow CPL 3 to fetch instructions from the code
-    // page and read/write the stack page.
-    //
-    // The code is read-only (`writable = false`); a user task
-    // must not be able to modify its own instructions. The stack
-    // is writable.
 
     if core
         .map_memory(as_cap, code_cap, USER_CODE_BASE, false, true)
@@ -384,13 +423,7 @@ pub fn setup_session_3_user_space() -> Option<(CapabilityId, ObjectId, ObjectId,
         return None;
     }
 
-    // ---- 5. Build the user entry. ----
-
     let entry = UserEntry::new(USER_CODE_BASE, USER_STACK_BASE + USER_STACK_SIZE);
 
-    // The address-space capability is returned; the code and
-    // stack object IDs are returned so the caller can clean up
-    // later. Their capabilities are not returned, because the
-    // caller does not need them.
     Some((as_cap, code_obj, stack_obj, entry))
 }
