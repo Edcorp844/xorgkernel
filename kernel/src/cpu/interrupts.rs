@@ -97,11 +97,14 @@ pub extern "C" fn irq_dispatch(irq: u32) {
         return;
     }
 
-    // Fetch the handler. Doing this through a raw read of the
-    // static avoids holding a lock across the handler call, which
-    // would be a problem if the handler needs to register another
-    // handler (it usually doesn't, but the discipline is worth
-    // keeping).
+    // Send the EOI *before* calling the handler. The handler may
+    // call `schedule_and_switch`, which can pause execution for an
+    // arbitrary amount of time. If the EOI were sent after the
+    // handler, the PIC would not deliver further IRQ0 until the
+    // interrupted task was rescheduled, and the timer would appear
+    // to stop.
+    pic::end_of_interrupt(irq);
+
     let handler = unsafe { HANDLERS[irq as usize] };
 
     match handler {
@@ -110,9 +113,4 @@ pub extern "C" fn irq_dispatch(irq: u32) {
             println!("interrupts: unhandled IRQ {}", irq);
         }
     }
-
-    // Notify the PIC that the interrupt has been handled. Without
-    // this, the PIC will not deliver further interrupts on the
-    // same priority level.
-    pic::end_of_interrupt(irq);
 }

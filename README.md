@@ -1141,7 +1141,7 @@ The existing bootloader, paging subsystem, memory map discovery, IDT and physica
 * [x] Capability transfer
 * [x] Capability restriction
 * [x] Capability revocation
-* [ ] Object lifetime management
+* [x] Object lifetime management
 
 ## Phase 2 — Execution Fabric
 

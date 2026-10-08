@@ -14,15 +14,18 @@
 //! # Vector assignments
 //!
 //! ```text
-//!   0 -  31   CPU exceptions
-//!  32 -  47   hardware IRQs (after PIC remap)
-//!  48 - 255   unused (reserved)
+//!    0 -  31    CPU exceptions
+//!   32 -  47    hardware IRQs (after PIC remap)
+//!   48 - 127    unused (reserved)
+//!  128 (0x80)   syscall gate
+//!  129 - 255    unused (reserved)
 //! ```
 //!
 //! CPU exceptions are handled by the stubs in `exceptions.S`.
-//! Hardware IRQs are handled by the stubs in `irq.S`. Both sets of
-//! stubs normalize the interrupt frame so that the Rust dispatcher
-//! sees a uniform layout.
+//! Hardware IRQs are handled by the stubs in `irq.S`. The syscall
+//! gate is handled by the stub in `syscall.S`. Each stub is
+//! responsible for saving whatever state its handler needs; see
+//! the individual `.S` files for the frame layouts they produce.
 //!
 //! # Gate format
 //!
@@ -45,10 +48,27 @@
 //!   bits 3-0 type 0xE = 32-bit interrupt gate, 0xF = 32-bit trap gate
 //! ```
 //!
-//! The kernel uses `0x8E`, which is a present, ring-0, 32-bit
-//! interrupt gate. Interrupt gates clear IF on entry, so the CPU
-//! will not deliver another interrupt while the handler runs. This
-//! is the usual choice for both exceptions and IRQs.
+//! The kernel uses two flags values:
+//!
+//! - `0x8E` — present, DPL 0, 32-bit interrupt gate. Used for
+//!   every CPU exception and every hardware IRQ.
+//! - `0xEE` — present, DPL 3, 32-bit interrupt gate. Used for the
+//!   syscall gate at vector 0x80.
+//!
+//! Interrupt gates clear IF on entry, so a handler runs with
+//! interrupts disabled. This is correct for exceptions and IRQs
+//! (the CPU is already in a privileged context and the handler must
+//! not be preempted by another interrupt of the same class), and it
+//! is correct for the syscall gate (a syscall handler must not be
+//! preempted mid-execution by a timer tick that could observe an
+//! inconsistent frame).
+//!
+//! The DPL controls *who may invoke* the gate; the code segment
+//! selector controls *what privilege level the handler runs at*.
+//! The syscall gate is DPL 3 so that CPL-3 code can invoke it, but
+//! its selector is `0x08` (kernel code), so the handler runs at
+//! CPL 0. That combination — a DPL-3 gate into a ring-0 handler —
+//! is the standard shape for a syscall entry.
 
 use crate::arch;
 use core::arch::asm;
@@ -67,6 +87,13 @@ const IRQ_VECTOR_BASE: usize = 32;
 /// The 8259 PIC provides 16 IRQ lines (0-15), corresponding to
 /// vectors 32-47.
 const IRQ_VECTOR_COUNT: usize = 16;
+
+/// The vector used for the syscall gate.
+///
+/// 0x80 is the traditional x86 Linux syscall vector. It is above
+/// the IRQ range (after the PIC remap, IRQs are at 0x20-0x2F) and
+/// does not collide with any CPU exception.
+pub const SYSCALL_VECTOR: usize = 0x80;
 
 /// A single IDT entry.
 ///
@@ -99,6 +126,7 @@ impl IdtEntry {
     /// An entry with the present bit clear causes the CPU to raise
     /// #GP if the corresponding vector is ever delivered. This is
     /// the correct initial state for a vector with no handler.
+    #[allow(dead_code)]
     const MISSING: Self = Self {
         offset_low: 0,
         selector: 0,
@@ -110,7 +138,8 @@ impl IdtEntry {
     /// Builds an entry for a ring-0, 32-bit interrupt gate.
     ///
     /// The handler address is split across the offset fields, and
-    /// the gate is marked present with DPL 0.
+    /// the gate is marked present with DPL 0. This is the shape
+    /// used for CPU exceptions and hardware IRQs.
     fn new(handler: unsafe extern "C" fn()) -> Self {
         let address = handler as usize as u32;
 
@@ -119,6 +148,29 @@ impl IdtEntry {
             selector: 0x08,
             zero: 0,
             flags: 0x8E,
+            offset_high: (address >> 16) as u16,
+        }
+    }
+
+    /// Builds an entry for a ring-3, 32-bit interrupt gate.
+    ///
+    /// The flags byte is `0xEE`: present, DPL 3, 32-bit interrupt
+    /// gate. DPL 3 is what allows `int 0x80` from CPL 3 to be
+    /// delivered without a #GP; a DPL-0 gate would reject the
+    /// instruction.
+    ///
+    /// The selector is still `0x08` (kernel code): the handler runs
+    /// at CPL 0 even though the gate is DPL 3. The DPL controls
+    /// *who may call* the gate; the selector controls *what
+    /// privilege level the handler runs at*.
+    fn new_user_callable(handler: unsafe extern "C" fn()) -> Self {
+        let address = handler as usize as u32;
+
+        Self {
+            offset_low: address as u16,
+            selector: 0x08,
+            zero: 0,
+            flags: 0xEE,
             offset_high: (address >> 16) as u16,
         }
     }
@@ -174,8 +226,9 @@ unsafe fn set_entry(vector: usize, entry: IdtEntry) {
 ///
 /// - CPU exceptions 0-31
 /// - hardware IRQs 32-47
+/// - the syscall gate at vector 0x80
 ///
-/// Vectors 48-255 are left as `MISSING`. Delivering one of them
+/// All other vectors are left as `MISSING`. Delivering one of them
 /// raises #GP, which the kernel treats as a fatal exception.
 ///
 /// Must be called exactly once, after the GDT is loaded and before
@@ -246,6 +299,17 @@ pub fn init() {
         set_entry(IRQ_VECTOR_BASE + 14, IdtEntry::new(irq_entry_46));
         set_entry(IRQ_VECTOR_BASE + 15, IdtEntry::new(irq_entry_47));
 
+        // ---- Syscall gate. ----
+        //
+        // Vector 0x80, DPL 3, ring-0 code. User code can invoke
+        // this gate with `int 0x80`; the handler runs at CPL 0.
+        //
+        // The gate is installed here but the syscall handler is
+        // not yet implemented. Session 2 tests the ring-0 path;
+        // Session 3 will add the ring-3 `iret` path and the first
+        // real syscall.
+        set_entry(SYSCALL_VECTOR, IdtEntry::new_user_callable(syscall_entry));
+
         // ---- Load the IDT. ----
 
         let pointer = IdtPointer {
@@ -261,8 +325,8 @@ pub fn init() {
     }
 
     println!(
-        "IDT loaded: {} entries, {} exceptions, {} IRQs",
-        IDT_ENTRIES, 32, IRQ_VECTOR_COUNT,
+        "IDT loaded: {} entries, {} exceptions, {} IRQs, syscall gate at 0x{:02x}",
+        IDT_ENTRIES, 32, IRQ_VECTOR_COUNT, SYSCALL_VECTOR,
     );
 }
 
@@ -352,4 +416,14 @@ unsafe extern "C" {
     fn irq_entry_45();
     fn irq_entry_46();
     fn irq_entry_47();
+}
+
+/// Syscall stub, defined in `syscall.S`.
+///
+/// The stub is the low-level entry point for `int 0x80`. It saves
+/// the general-purpose registers, passes the current stack pointer
+/// to `cpu::syscall::syscall_dispatch`, and returns via `iret`. See
+/// `syscall.S` for the frame layout.
+unsafe extern "C" {
+    fn syscall_entry();
 }

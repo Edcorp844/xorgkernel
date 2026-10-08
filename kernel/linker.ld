@@ -83,7 +83,7 @@ SECTIONS
     .gdt (NOLOAD) : ALIGN(16)
     {
         __gdt_start = .;
-        . += 24;
+        . += 48;
         __gdt_end = .;
     }
 

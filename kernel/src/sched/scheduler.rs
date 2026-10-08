@@ -218,6 +218,69 @@ impl Scheduler {
         Some(id)
     }
 
+    /// Creates a user task and registers it with the scheduler.
+    ///
+    /// The counterpart to [`Scheduler::create`] for tasks that run
+    /// at CPL 3. The scheduler's job is the same: allocate an ID,
+    /// build the task, link it into the all-tasks list, and
+    /// enqueue it on its priority's run queue.
+    ///
+    /// The difference is entirely in `Task::create_user`, which
+    /// lays out a different initial frame so that the task's first
+    /// schedule returns into
+    /// [`crate::cpu::usermode::iret_to_user`] and transitions to
+    /// CPL 3. The scheduler does not know or care about that
+    /// difference; it stores the same `Task` structure either way.
+    ///
+    /// # Arguments
+    ///
+    /// See [`Task::create_user`] for the meaning of each
+    /// parameter. The scheduler's role is to assign the ID and
+    /// register the task; the values of the other parameters are
+    /// passed through unchanged.
+    ///
+    /// # Return value
+    ///
+    /// Returns the task's ID on success, or `None` if the heap
+    /// cannot provide the kernel stack.
+    pub fn create_user(
+        &mut self,
+        name: &'static str,
+        priority: u8,
+        stack_size: usize,
+        cell: CellId,
+        address_space: CapabilityId,
+        user_entry: crate::cpu::usermode::UserEntry,
+    ) -> Option<u32> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+
+        let task = Box::new(Task::create_user(
+            id,
+            name,
+            priority,
+            stack_size,
+            cell,
+            address_space,
+            user_entry,
+        )?);
+
+        let task_ptr = Box::into_raw(task);
+
+        unsafe {
+            self.all_tasks.push_back(task_ptr);
+
+            let priority_index = priority as usize;
+            self.run_queues[priority_index].push_back(task_ptr);
+            self.active |= 1 << priority_index;
+        }
+
+        Some(id)
+    }
+
     /// Returns a reference to a task by ID.
     ///
     /// Linear in the number of live tasks. Fine for the current

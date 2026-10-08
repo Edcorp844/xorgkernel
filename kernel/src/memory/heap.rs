@@ -191,10 +191,6 @@ impl KernelHeap {
     /// The caller must ensure that no other thread is concurrently
     /// allocating and that interrupts are disabled.
     pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        unsafe {
-            marker(b'h');
-        }
-
         let align = layout.align().max(core::mem::align_of::<usize>());
         let size = layout.size();
 
@@ -222,10 +218,6 @@ impl KernelHeap {
             // The request is too large for the heap to serve, no
             // matter how many regions are installed.
             return core::ptr::null_mut();
-        }
-
-        unsafe {
-            marker(b'g');
         }
 
         if !unsafe { self.grow() } {

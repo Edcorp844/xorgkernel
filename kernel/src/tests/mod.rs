@@ -86,6 +86,7 @@ pub mod heap;
 pub mod kernel_map;
 pub mod memory;
 pub mod scheduler;
+pub mod user_mode;
 
 /// Runs every test in the suite.
 ///
@@ -137,6 +138,8 @@ pub mod scheduler;
 pub fn run_all() {
     capability::test_capability_operations();
     capability::test_cells();
+    user_mode::test_gdt_and_tss_loaded();
+    user_mode::test_syscall_from_ring_0();
     memory::test_memory_object_allocation();
     memory::test_map_memory();
     heap::test_heap();

@@ -62,7 +62,6 @@ pub mod scheduler;
 pub mod task;
 
 use crate::capability::capability::CapabilityId;
-use crate::capability::cell::CellId;
 
 use scheduler::Scheduler;
 use task::Task;
@@ -275,15 +274,31 @@ pub unsafe fn schedule_and_switch() {
 
         (from_ptr, to_ptr, to_as_cap)
     };
-
-    // ---- Phase 2: activate the target address space if needed.
+    // ---- Phase 2: update the TSS's kernel stack pointer. ----
     //
-    // We compare page-directory addresses rather than capability
-    // IDs. Two different capabilities can name the same address
-    // space (a capability and a derived one, for example), and
-    // the reload is only necessary when the underlying page
-    // directory differs. See the module documentation for the
-    // rationale.
+    // The TSS's `esp0` field is what the CPU loads into ESP when
+    // a privilege transition from CPL 3 to CPL 0 occurs. It must
+    // point at the *incoming* task's kernel stack top, or the
+    // first trap from user mode will push its frame onto the
+    // previous task's kernel stack.
+    //
+    // The top is `base + size`. `Task::create` lays out the
+    // initial frame below the top, so the top is the address the
+    // CPU should point at on entry.
+    //
+    // This runs on every switch, even for kernel-to-kernel
+    // switches. Kernel tasks never trap from CPL 3, so the value
+    // is not used in that case, but keeping it current means a
+    // task that is promoted to user mode later will have the
+    // right `esp0` from the moment of its first trap.
+
+    {
+        let to = unsafe { &*to_ptr };
+        let stack_top = to.kernel_stack_base + to.kernel_stack_size;
+        crate::cpu::tss::set_kernel_stack(stack_top);
+    }
+
+    // ---- Phase 3: activate the target address space if needed. ----
 
     if to_as_cap != CapabilityId::INVALID {
         let core = crate::capability::core_mut();
@@ -293,46 +308,14 @@ pub unsafe fn schedule_and_switch() {
             let current_pd = crate::cpu::control::read_cr3();
 
             if target_pd != current_pd {
-                // SAFETY: the target page directory is a
-                // fabric-registered address space, which means
-                // it was allocated by `AddressSpace::new` (or
-                // wrapped by `from_page_directory` for the
-                // kernel's own) and is therefore well-formed.
-                //
-                // The kernel's own mappings are copied into every
-                // address space by `AddressSpace::new`, so the
-                // kernel code, the kernel stack the incoming task
-                // will run on, and the kernel's direct map are
-                // all reachable after the switch.
                 unsafe {
                     crate::cpu::control::write_cr3(target_pd);
                 }
             }
         }
-        // If the capability does not resolve, the target's
-        // address space has been revoked since the task was
-        // created. This is a programming error, not a runtime
-        // condition: a task's address-space capability is meant
-        // to be held for the task's lifetime, and revoking it
-        // while the task is still live leaves the task in an
-        // address space the scheduler cannot name. The safest
-        // response is to leave CR3 as it is and continue; the
-        // task will run in the previous address space, which is
-        // wrong but not immediately fatal. A debug assertion
-        // here would catch it during development.
     }
 
-    // ---- Phase 3: register switch. ----
-    //
-    // SAFETY: `from_ptr` and `to_ptr` are raw pointers into the
-    // all-tasks list, which owns every live task and does not
-    // free a task except through `exit`. `exit` cannot run while
-    // we hold these pointers, because the scheduler is not
-    // accessible to any other context between phases 1 and 3
-    // (interrupts are disabled, the kernel is single-threaded).
-    // `switch_context` reads `to_ptr` and writes `from_ptr`
-    // before transferring control; both pointers are valid
-    // throughout.
+    // ---- Phase 4: register switch. ----
 
     unsafe {
         switch_context(from_ptr, to_ptr);

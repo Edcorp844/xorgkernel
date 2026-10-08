@@ -36,16 +36,22 @@
 //!    the scheduler takes over, with interrupts still disabled,
 //!    so they cannot be interleaved with timer ticks.
 //!
-//! 8. **Scheduler.** Initialize the scheduler, create one cell
+//! 8. **Scheduler.** Initialize the scheduler. Create one cell
 //!    per initial task, and create the tasks themselves. Each
 //!    task is linked to its cell and to the kernel address space
 //!    capability.
 //!
-//! 9. **Interrupts.** Configure the PIC and PIT, register the
-//!    timer handler, unmask IRQ0, and enable interrupts. The
-//!    first timer tick arrives while the idle task is running.
+//! 9. **User mode.** Set up a user address space (code page and
+//!    stack page, both user-accessible), load a small user blob
+//!    into it, and create a user task bound to that address
+//!    space. The user task runs at CPL 3 alongside the kernel
+//!    tasks.
 //!
-//! 10. **Scheduler handoff.** Call `schedule_and_switch`. This
+//! 10. **Interrupts.** Configure the PIC and PIT, register the
+//!     timer handler, unmask IRQ0, and enable interrupts. The
+//!     first timer tick arrives while the idle task is running.
+//!
+//! 11. **Scheduler handoff.** Call `schedule_and_switch`. This
 //!     never returns: execution continues in the idle task, and
 //!     `kernel_main`'s frame is left on the bootstrap stack,
 //!     saved into `BOOTSTRAP_TASK` and never restored.
@@ -60,6 +66,9 @@
 //!   the heap, so the heap must be up first.
 //! - The test suite exercises the fabric and the heap, so both
 //!   must be up first.
+//! - The user task setup allocates memory objects and a user
+//!   address space through the fabric, so the fabric must be up
+//!   first.
 //! - Interrupts are enabled last, so that no handler can run
 //!   before the structures it depends on exist.
 
@@ -86,6 +95,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::capability::capability::CapabilityRights;
+use crate::cpu::usermode;
 use crate::sched::task::{PRIORITY_IDLE, PRIORITY_NORMAL};
 
 // ---------------------------------------------------------------------
@@ -158,10 +168,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
         boot::multiboot2::init(multiboot_info);
     }
 
-    // Set up the early console sinks (serial and VGA text). These
-    // are unconditional: serial is used by every development
-    // setup, and VGA text is present on every PC the kernel is
-    // expected to run on.
+    // Set up the early console sinks (serial and VGA text).
     console::init();
 
     // Load the GDT and IDT, then enable paging and set up the
@@ -182,14 +189,10 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     // framebuffer is mapped through the direct-map machinery.
     setup_framebuffer();
 
-    // Initialize the frame allocator. After this call, physical
-    // frames can be allocated and freed.
+    // Initialize the frame allocator.
     memory::frame::init();
 
-    // Initialize the capability fabric. The fabric's state is
-    // constructed at load time; this call prints the
-    // configuration and is the place where future runtime
-    // initialization will live.
+    // Initialize the capability fabric.
     capability::init();
 
     // ---- Kernel address space. ----
@@ -198,22 +201,11 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     // that it can be used as a target for `map_memory`. The
     // kernel address space already exists: it was established by
     // `paging::init`, and it holds the identity map, the direct
-    // map, and every kernel code and data mapping. Registering it
-    // does not create anything; it wraps the existing page
-    // directory so the fabric can hand out a capability to it.
+    // map, and every kernel code and data mapping.
     //
     // The capability is stored in a fabric-global static because
     // many later subsystems need it and none of them has a
-    // convenient path back to this function's locals:
-    //
-    // - `memory::heap::grow` uses it to install new heap regions.
-    // - The scheduler's task-creation path stores it in every
-    //   kernel task's `address_space` field.
-    // - The test suite uses it to exercise the mapping path.
-    //
-    // The capability is never revoked. Revoking it would leave
-    // the kernel unable to install mappings, which is not a
-    // recoverable state.
+    // convenient path back to this function's locals.
     let kernel_as_rights =
         CapabilityRights::MAP | CapabilityRights::UNMAP | CapabilityRights::SHARE;
 
@@ -226,9 +218,7 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     // ---- Kernel heap. ----
     //
     // The heap needs a capability to the kernel's address space,
-    // so it can install mappings into it as it grows. From this
-    // point on, `Box`, `Vec`, and every other `alloc` type can be
-    // used.
+    // so it can install mappings into it as it grows.
     memory::heap::init(kernel_as_cap);
 
     println!();
@@ -236,34 +226,28 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
 
     // ---- Substrate tests. ----
     //
-    // Run the full test suite. Tests run with interrupts disabled
-    // and before the scheduler takes over, so they cannot be
-    // interleaved with timer ticks. They must finish before
-    // `sched::init` is called.
+    // Run the full test suite before the scheduler takes over.
     tests::run_all();
 
     // ---- Scheduler bootstrap. ----
     //
     // From this point on, the kernel runs as a task, not as
-    // `kernel_main`. The scheduler is initialized, then one cell
-    // and one task are created for each initial task. The cells
-    // are empty for now; the tasks hold no capabilities. When IPC
-    // and syscalls arrive, cells will be populated with the
-    // capabilities their tasks should hold.
+    // `kernel_main`.
     sched::init();
 
-    let core = capability::core_mut();
-
-    // ---- Idle task. ----
+    // Each task gets its own cell. The cells are empty for now;
+    // they exist so that every running task is a first-class
+    // fabric participant.
     //
-    // The idle task runs when nothing else is ready. It executes
-    // `hlt` in a loop, suspending the CPU until the next
-    // interrupt. It is created first so that if the scheduler is
-    // given control before the other tasks are ready (which
-    // cannot happen in the current boot sequence, but is a
-    // reasonable property to maintain), there is always at least
-    // one task to run.
-    let idle_cell = core.create_cell().expect("idle cell creation failed");
+    // Note: `capability::core_mut()` is called fresh at each use
+    // site rather than bound to a local. Binding it to a `let`
+    // would keep the borrow live across the `setup_session_3_user_space`
+    // call below, which itself calls `core_mut()` internally, and
+    // the two would alias.
+
+    let idle_cell = capability::core_mut()
+        .create_cell()
+        .expect("idle cell creation failed");
     let idle_id = sched::scheduler_mut()
         .create(
             "idle",
@@ -275,19 +259,9 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
         )
         .expect("idle task creation failed");
 
-    // ---- Test tasks. ----
-    //
-    // Two normal-priority tasks that print and yield. Their
-    // purpose is to demonstrate preemption and round-robin
-    // scheduling: with two tasks at the same priority, the timer
-    // tick alternates between them, and the serial output shows
-    // interleaved progress.
-    //
-    // These will be removed once there is a real way to create
-    // tasks (a `spawn` syscall, a userspace init process, or
-    // similar). Until then they are the only thing exercising
-    // the scheduler's preemption path.
-    let a_cell = core.create_cell().expect("task-a cell creation failed");
+    let a_cell = capability::core_mut()
+        .create_cell()
+        .expect("task-a cell creation failed");
     let a_id = sched::scheduler_mut()
         .create(
             "task-a",
@@ -299,7 +273,9 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
         )
         .expect("task-a creation failed");
 
-    let b_cell = core.create_cell().expect("task-b cell creation failed");
+    let b_cell = capability::core_mut()
+        .create_cell()
+        .expect("task-b cell creation failed");
     let b_id = sched::scheduler_mut()
         .create(
             "task-b",
@@ -310,6 +286,55 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
             kernel_as_cap,
         )
         .expect("task-b creation failed");
+
+    // ---- User task. ----
+    //
+    // Set up a user address space with a code page and a stack
+    // page, both accessible from CPL 3. Load a tiny user blob
+    // into the code page. Create a user task bound to that
+    // address space.
+    //
+    // On first schedule, the task's initial frame sends
+    // `switch_context`'s `ret` into `iret_to_user`, which `iret`s
+    // into the blob at CPL 3. The blob executes `int 0x80`, which
+    // traps back to CPL 0 through the syscall gate. The kernel's
+    // syscall handler sees the trap's saved CS with RPL 3 — the
+    // observable signal that user mode is live.
+    //
+    // The user task runs alongside the kernel tasks. Its cell is
+    // empty; Session 4 will give it capabilities.
+    let user_setup = usermode::setup_session_3_user_space();
+
+    match user_setup {
+        Some((user_as_cap, _user_code_obj, _user_stack_obj, user_entry)) => {
+            let user_cell = capability::core_mut()
+                .create_cell()
+                .expect("user cell creation failed");
+
+            let user_id = sched::scheduler_mut()
+                .create_user(
+                    "user",
+                    PRIORITY_NORMAL,
+                    16384,
+                    user_cell,
+                    user_as_cap,
+                    user_entry,
+                )
+                .expect("user task creation failed");
+
+            println!();
+            println!("User task created:");
+            println!("  id            = {}", user_id);
+            println!("  cell          = {}", user_cell.raw());
+            println!("  address space = 0x{:08x}", user_as_cap.raw());
+            println!("  entry point   = 0x{:08x}", user_entry.entry_point);
+            println!("  stack top     = 0x{:08x}", user_entry.stack_top);
+        }
+        None => {
+            println!();
+            println!("WARNING: user task setup failed; no user mode this boot");
+        }
+    }
 
     println!();
     println!("Handing control to the scheduler...");
@@ -323,29 +348,17 @@ pub extern "C" fn kernel_main(multiboot_info: *const u8) -> ! {
     // The timer drives preemption once it is enabled. We set it
     // up before yielding so that the first tick arrives while the
     // initial task is running.
-    //
-    // The PIC remap must happen before any IRQ is unmasked. Before
-    // remapping, IRQ0 is delivered at vector 0x08, which
-    // collides with the CPU's double-fault exception. Remapping
-    // moves IRQs to vectors 0x20-0x2F, which are free.
     setup_interrupts();
 
     // Yield to the scheduler. This never returns: the first
     // context switch saves `kernel_main`'s registers into
     // `BOOTSTRAP_TASK` and loads the first task's registers from
-    // its kernel stack. From here on, execution is in a task.
+    // its kernel stack.
     unsafe {
         sched::schedule_and_switch();
     }
 
     // Unreachable.
-    //
-    // If the scheduler ever selected the bootstrap task again,
-    // `switch_context` would restore the registers saved above
-    // and execution would resume here. The bootstrap task has no
-    // ID and is not in any list, so this cannot happen; the loop
-    // is here to satisfy the type checker and to halt cleanly if
-    // it ever does.
     loop {
         core::hint::spin_loop();
     }
@@ -367,8 +380,7 @@ fn setup_framebuffer() {
     let size_bytes = info.pitch * info.height;
 
     // Map the framebuffer at a dedicated virtual address, using
-    // uncached 4 MiB pages. Uncached is required: the framebuffer
-    // is MMIO, and CPU caching would delay writes to the device.
+    // uncached 4 MiB pages.
     let virt_base = memory::direct_map::map_mmio(info.address as u32, size_bytes) as *mut u8;
 
     if virt_base.is_null() {
@@ -448,23 +460,16 @@ fn setup_interrupts() {
 ///
 /// Called by the IRQ dispatch path each time the PIT fires. After
 /// updating the tick counter and printing periodically, hands
-/// control to the scheduler. If a higher-priority task is ready,
-/// or if the current task's time slice has expired, the scheduler
-/// switches to it.
+/// control to the scheduler.
 ///
 /// The handler runs with interrupts disabled (interrupt gates
 /// clear IF on entry), so it cannot be preempted by another timer
-/// tick. It must complete quickly: any work done here delays the
-/// interrupted task's resumption by the same amount.
+/// tick. It must complete quickly.
 fn on_timer_tick() {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     if n % TICKS_PER_REPORT == 0 {
         println!("tick: {}", n);
-    }
-
-    unsafe {
-        sched::schedule_and_switch();
     }
 }
 
@@ -475,13 +480,7 @@ fn on_timer_tick() {
 /// The idle task.
 ///
 /// Runs when nothing else is ready. `hlt` suspends the CPU until
-/// the next interrupt, which is either the next timer tick (which
-/// will schedule something else if anything is ready) or a device
-/// interrupt (which a driver handler will service).
-///
-/// The task never returns; it loops forever. If the idle task ever
-/// exited, the scheduler would have nothing to run when all other
-/// tasks were blocked, and the kernel would spin.
+/// the next interrupt.
 fn idle_task() -> ! {
     loop {
         unsafe {
@@ -495,10 +494,6 @@ fn idle_task() -> ! {
 /// Prints a counter, increments it, and yields. With task B at the
 /// same priority, the timer tick and the yields interleave the two
 /// tasks' output on the serial console.
-///
-/// This task and `task_b` exist only to demonstrate the scheduler
-/// and the preemption path. They will be removed once there is a
-/// real way to create tasks.
 fn task_a() -> ! {
     let mut count = 0u32;
     loop {
@@ -527,12 +522,7 @@ fn task_b() -> ! {
 /// The kernel's panic handler.
 ///
 /// Prints the panic message and halts. There is no unwinding: the
-/// kernel is built with `panic = "abort"`, and there is nothing
-/// useful to unwind to anyway.
-///
-/// The handler does not attempt to recover. A panic in kernel code
-/// is a bug, and continuing after one would leave the system in an
-/// unknown state. Halting is the only correct response.
+/// kernel is built with `panic = "abort"`.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!();

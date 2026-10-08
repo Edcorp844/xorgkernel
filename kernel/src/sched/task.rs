@@ -75,6 +75,7 @@ use alloc::boxed::Box;
 
 use crate::capability::capability::CapabilityId;
 use crate::capability::cell::CellId;
+use crate::cpu::usermode::UserEntry;
 
 // ---------------------------------------------------------------------
 // Task state
@@ -300,6 +301,27 @@ pub struct Task {
     ///
     /// Cached for the same reason as `kernel_stack_base`.
     pub kernel_stack_size: u32,
+
+    /// The user entry point and stack top, or `None` for a kernel
+    /// task.
+    ///
+    /// A kernel task runs entirely at CPL 0: `switch_context`'s
+    /// `ret` returns into the task's entry function, and the task
+    /// never leaves ring 0.
+    ///
+    /// A user task runs at CPL 3 in its own address space.
+    /// `switch_context`'s `ret` returns into
+    /// [`crate::cpu::usermode::iret_to_user`], which executes
+    /// `iret` and pops the five-dword frame `Task::create_user`
+    /// laid out on the kernel stack. After the `iret`, the CPU is
+    /// at CPL 3, running the user code at the entry point with
+    /// the user stack pointer the `UserEntry` specifies.
+    ///
+    /// The field is `Option` rather than a flag plus two
+    /// `Option<u32>` fields because the two values only make
+    /// sense together. A task has a user entry point *and* a user
+    /// stack top, or it has neither.
+    pub user_entry: Option<crate::cpu::usermode::UserEntry>,
 }
 
 impl Task {
@@ -428,6 +450,171 @@ impl Task {
             kernel_stack: Some(kernel_stack),
             kernel_stack_base: base,
             kernel_stack_size: stack_size as u32,
+            user_entry: None,
+        })
+    }
+
+    /// Creates a user task with the given parameters.
+    ///
+    /// Like [`Task::create`], but the task runs at CPL 3 in the
+    /// address space its `address_space` capability names. The
+    /// initial frame on the kernel stack is laid out so that
+    /// `switch_context`'s `ret` lands in
+    /// [`crate::cpu::usermode::iret_to_user`], which executes
+    /// `iret` and pops the five-dword user frame below the return
+    /// address.
+    ///
+    /// # The initial frame
+    ///
+    /// From lowest to highest address on the kernel stack:
+    ///
+    /// ```text
+    ///   +0   EBX = 0
+    ///   +4   ESI = 0
+    ///   +8   EDI = 0
+    ///   +12  EBP = 0
+    ///   +16  iret_to_user
+    ///   +20  user EIP
+    ///   +24  user CS   (0x18 | 3)
+    ///   +28  user EFLAGS (0x202)
+    ///   +32  user ESP
+    ///   +36  user SS   (0x20 | 3)
+    /// ```
+    ///
+    /// `Task.esp` points at `+0`. On first schedule,
+    /// `switch_context` restores the four callee-saved registers
+    /// (all zero), executes `ret`, which pops `iret_to_user`, and
+    /// lands in the `iret` instruction with `ESP` pointing at
+    /// `+20`. The `iret` pops `EIP, CS, EFLAGS, ESP, SS` and
+    /// transitions to CPL 3.
+    ///
+    /// # Why the frame matches the CPU-pushed shape
+    ///
+    /// The five dwords at `+20` are in the exact order the CPU
+    /// pushes them on a trap from CPL 3: `EIP, CS, EFLAGS, ESP,
+    /// SS`. That means `iret_to_user` can be reached both from a
+    /// fresh task's first run (through this frame) and from a
+    /// syscall return (through the frame the CPU pushed on trap
+    /// entry), with the same `iret` handling both cases. There is
+    /// no separate "first-time return" path; the design point is
+    /// that first-time return and syscall return are the same
+    /// code path with the same frame shape.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: the task's identifier, assigned by the scheduler.
+    /// - `name`: a human-readable name, used only in diagnostics.
+    /// - `priority`: the task's priority, less than
+    ///   [`NUM_PRIORITIES`].
+    /// - `stack_size`: the size of the *kernel* stack, in bytes.
+    ///   The user stack is separate and is described by
+    ///   `user_entry.stack_top`.
+    /// - `cell`: the task's capability namespace. Must be valid.
+    /// - `address_space`: the capability to the task's user
+    ///   address space. Must not be `INVALID`, and must name an
+    ///   address space the task is permitted to run in.
+    /// - `user_entry`: the user code's entry point and the user
+    ///   stack top, both as user virtual addresses.
+    ///
+    /// # Return value
+    ///
+    /// Returns `None` if the heap cannot provide the requested
+    /// kernel stack size, or if a precondition is violated.
+    pub fn create_user(
+        id: u32,
+        name: &'static str,
+        priority: u8,
+        stack_size: usize,
+        cell: CellId,
+        address_space: CapabilityId,
+        user_entry: UserEntry,
+    ) -> Option<Self> {
+        assert!(
+            priority < NUM_PRIORITIES as u8,
+            "task: priority out of range"
+        );
+        assert!(stack_size >= 256, "task: stack size too small");
+        assert!(cell.is_valid(), "task: invalid cell");
+        assert!(
+            address_space != CapabilityId::INVALID,
+            "task: invalid address space"
+        );
+        assert!(
+            user_entry.entry_point != 0,
+            "task: user entry point must not be zero"
+        );
+        assert!(
+            user_entry.stack_top != 0,
+            "task: user stack top must not be zero"
+        );
+
+        // Allocate the kernel stack from the heap.
+        let kernel_stack = alloc::vec![0u8; stack_size].into_boxed_slice();
+
+        let base = kernel_stack.as_ptr() as u32;
+        let top = base + stack_size as u32;
+
+        // Lay out the initial frame.
+        //
+        // Order matters. The layout must match what
+        // `switch_context` and `iret_to_user` expect. See the
+        // method documentation for the frame diagram.
+        let mut sp = top;
+        unsafe {
+            // The five-dword `iret` frame, highest address first.
+            //
+            // `iret` pops in the order: EIP, CS, EFLAGS, ESP, SS.
+            // So SS must be at the highest address and EIP at
+            // the lowest of the five.
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, UserEntry::user_ss());
+
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, user_entry.stack_top);
+
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, UserEntry::user_eflags());
+
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, UserEntry::user_cs());
+
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, user_entry.entry_point);
+
+            // The return address that `switch_context`'s `ret`
+            // will pop. For a user task, this is `iret_to_user`,
+            // not a Rust function.
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, crate::cpu::usermode::iret_to_user_address());
+
+            // Saved callee-saved registers, in the order
+            // `switch_context` will pop them.
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, 0); // EBP
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, 0); // EDI
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, 0); // ESI
+            sp -= 4;
+            ::core::ptr::write(sp as *mut u32, 0); // EBX
+        }
+
+        Some(Self {
+            esp: sp,
+            id,
+            name,
+            state: TaskState::Ready,
+            priority,
+            cell,
+            address_space,
+            user_entry: Some(user_entry),
+            all_next: None,
+            all_prev: None,
+            run_next: None,
+            run_prev: None,
+            kernel_stack: Some(kernel_stack),
+            kernel_stack_base: base,
+            kernel_stack_size: stack_size as u32,
         })
     }
 
@@ -472,6 +659,7 @@ impl Task {
             kernel_stack: None,
             kernel_stack_base: 0,
             kernel_stack_size: 0,
+            user_entry: None,
         }
     }
 
@@ -533,5 +721,15 @@ impl Task {
     /// cell's own address space.
     pub const fn address_space(&self) -> CapabilityId {
         self.address_space
+    }
+
+    /// Returns whether this task is a user task.
+    pub const fn is_user(&self) -> bool {
+        self.user_entry.is_some()
+    }
+
+    /// Returns the user entry, if this is a user task.
+    pub const fn user_entry(&self) -> Option<UserEntry> {
+        self.user_entry
     }
 }

@@ -1,12 +1,16 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/cpu/exceptions.S");
     println!("cargo:rerun-if-changed=src/cpu/irq.S");
+    println!("cargo:rerun-if-changed=src/cpu/syscall.S");
+    println!("cargo:rerun-if-changed=src/cpu/usermode.S");
     println!("cargo:rerun-if-changed=src/sched/context.S");
     println!("cargo:rerun-if-changed=src/boot/grub_header.S");
 
     cc::Build::new()
         .file("src/cpu/exceptions.S")
         .file("src/cpu/irq.S")
+        .file("src/cpu/syscall.S")
+        .file("src/cpu/usermode.S")
         .file("src/sched/context.S")
         .file("src/boot/grub_header.S")
         .flag("-m32")
